@@ -1,0 +1,14 @@
+# Build output files
+*.txt
+*.log
+out.txt
+stderr.txt
+flash_out.txt
+build_errors.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/settings.json
