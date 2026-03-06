@@ -162,6 +162,13 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
     </div>
     <input type="checkbox" class="feat-toggle" id="feat_start_lights" onchange="saveFeature('start_lights',this.checked)">
   </div>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#128564; Deep Sleep</div>
+      <div class="feat-desc">Outside race weekends the lamp sleeps (5&thinsp;&micro;A) and wakes every 5&ndash;60&thinsp;min depending on schedule. Requires battery use; disabled by default.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_deep_sleep" onchange="saveFeature('deep_sleep',this.checked)">
+  </div>
   <hr>
   <div style="font-size:.7rem;color:#555;margin-bottom:6px">Test without a live session:</div>
   <div style="display:flex;flex-wrap:wrap;gap:5px">
@@ -317,6 +324,7 @@ async function loadFeatures(){
     document.getElementById('feat_fastest_lap').checked  = d.fastest_lap   ||false;
     document.getElementById('feat_drs').checked          = d.drs           ||false;
     document.getElementById('feat_start_lights').checked = d.start_lights  ||false;
+    document.getElementById('feat_deep_sleep').checked    = d.deep_sleep    ||false;
   }catch(e){}
 }
 async function saveFeature(name,val){
@@ -540,6 +548,7 @@ void webui_init(
         doc["fastest_lap"]  = g_cfg.feat_fastest_lap;
         doc["drs"]          = g_cfg.feat_drs;
         doc["start_lights"] = g_cfg.feat_start_lights;
+        doc["deep_sleep"]   = g_cfg.deep_sleep;
         String out; serializeJson(doc, out);
         sendJson(req, out);
     });
@@ -552,6 +561,7 @@ void webui_init(
             if (obj["fastest_lap"].is<bool>())  g_cfg.feat_fastest_lap  = obj["fastest_lap"];
             if (obj["drs"].is<bool>())          g_cfg.feat_drs          = obj["drs"];
             if (obj["start_lights"].is<bool>()) g_cfg.feat_start_lights = obj["start_lights"];
+            if (obj["deep_sleep"].is<bool>())     g_cfg.deep_sleep        = obj["deep_sleep"];
             cfg_save();
             sendOk(req);
         });

@@ -43,6 +43,7 @@ struct AppConfig {
     bool     feat_fastest_lap;   /* purple flash on fastest lap                    */
     bool     feat_drs;           /* brief white pulse when DRS zones open          */
     bool     feat_start_lights;  /* 5-red-lights countdown on session start        */
+    bool     deep_sleep;         /* enter deep sleep between sessions              */
 
     StateEffect states[CFG_NUM_STATES];
 };

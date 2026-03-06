@@ -23,6 +23,7 @@ void cfg_defaults() {
     g_cfg.feat_fastest_lap  = true;
     g_cfg.feat_drs          = false;  /* fires frequently in practice – off by default */
     g_cfg.feat_start_lights = true;
+    g_cfg.deep_sleep        = false;  /* opt-in – off by default                        */
 
     /* StateEffect fields: {effect, r, g, b, speed, r2, g2, b2, revert_s}
      *
@@ -93,6 +94,7 @@ void cfg_load() {
     g_cfg.feat_fastest_lap  = doc["feat_fastest_lap"]  | true;
     g_cfg.feat_drs          = doc["feat_drs"]          | false;
     g_cfg.feat_start_lights = doc["feat_start_lights"] | true;
+    g_cfg.deep_sleep        = doc["deep_sleep"]        | false;
 
     JsonArray arr = doc["states"].as<JsonArray>();
     for (int i = 0; i < CFG_NUM_STATES && i < (int)arr.size(); i++) {
@@ -129,6 +131,7 @@ void cfg_save() {
     doc["feat_fastest_lap"]  = g_cfg.feat_fastest_lap;
     doc["feat_drs"]          = g_cfg.feat_drs;
     doc["feat_start_lights"] = g_cfg.feat_start_lights;
+    doc["deep_sleep"]        = g_cfg.deep_sleep;
 
     JsonArray arr = doc["states"].to<JsonArray>();
     for (int i = 0; i < CFG_NUM_STATES; i++) {

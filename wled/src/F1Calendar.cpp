@@ -162,6 +162,26 @@ float f1cal_idleFactor() {
 
 bool f1cal_hasData() { return s_hasData; }
 
+bool f1cal_weekendActive() {
+    if (!s_hasData) return false;
+    time_t now = time(nullptr);
+    /* Allow 30 min before FP1; end of window = race day midnight + 27 h
+       (covers any race regardless of local start time + ~3 h duration). */
+    time_t winStart = s_firstSessEpoch - 1800;
+    time_t winEnd   = s_raceEpoch + 97200;   /* 27 h after race-day midnight */
+    return (now >= winStart && now < winEnd);
+}
+
+uint32_t f1cal_sleepSeconds() {
+    if (!s_hasData) return 3600;
+    time_t now = time(nullptr);
+    double secsToWake = difftime(s_firstSessEpoch - 1800, now);
+    if (secsToWake < 7200.0)   return  300;   /* < 2 h  → wake every 5 min  */
+    if (secsToWake < 86400.0)  return  900;   /* < 24 h → every 15 min      */
+    if (secsToWake < 604800.0) return 1800;   /* < 7 d  → every 30 min      */
+    return 3600;                              /* > 7d   → every 1 h         */
+}
+
 const char* f1cal_nextRaceDate() { return s_raceDate; }
 
 int f1cal_daysUntilRace() {

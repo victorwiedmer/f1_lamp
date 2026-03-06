@@ -16,6 +16,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <time.h>
+#include <esp_sleep.h>
 #include "Config.h"
 #include "LedFx.h"
 #include "WebUI.h"
@@ -291,6 +292,25 @@ void setup() {
     if (sta) {
         LOGF("  Home network: http://%s\n", WiFi.localIP().toString().c_str());
         LOG("  mDNS: http://f1lamp.local\n");
+    }
+
+    /* ── Deep sleep: if enabled and outside a race weekend, hibernate ───── */
+    if (g_cfg.deep_sleep) {
+        bool awake = f1cal_weekendActive();
+        if (!awake) {
+            uint32_t secs = f1cal_sleepSeconds();
+            Serial.printf("[Sleep] Deep sleep for %us (%.1f min)\n",
+                          secs, secs / 60.0f);
+            /* 1-second white pulse so you can see it's alive before sleeping */
+            ledfx_setEffect(0, 12, 12, 12, g_cfg.brightness);
+            ledfx_tick();
+            delay(1000);
+            ledfx_allOff();
+            delay(50);
+            esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+            esp_deep_sleep_start();   /* never returns */
+        }
+        Serial.println("[Sleep] Race weekend active – staying awake");
     }
 }
 

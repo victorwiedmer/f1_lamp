@@ -41,3 +41,20 @@ const char* f1cal_nextRaceDate();
 
 /* Days until race day (0 = today, negative = past) — INT16_MIN if no data */
 int f1cal_daysUntilRace();
+
+/*
+ * Deep-sleep helpers.
+ *
+ * weekendActive – true if now falls inside the race weekend window:
+ *   (FP1/SprintQ start − 30 min)  →  (race-day midnight + 27 h)
+ *   Use to decide whether to stay fully awake.
+ *
+ * sleepSeconds – recommended deep-sleep duration based on proximity to
+ *   the next FP1/SprintQ start.  Call only when !weekendActive.
+ *     > 7 days away  → 3 600 s (1 h)
+ *     1 – 7 days     → 1 800 s (30 min)
+ *     < 24 h         →   900 s (15 min)
+ *     < 2 h          →   300 s (5 min)
+ */
+bool     f1cal_weekendActive();
+uint32_t f1cal_sleepSeconds();
