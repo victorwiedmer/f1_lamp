@@ -33,9 +33,12 @@
    ---------------------------------------------------------------- */
 static constexpr uint32_t RECONNECT_INIT_MS  =   5000;
 static constexpr uint32_t RECONNECT_MAX_MS   = 120000;
-static constexpr uint32_t PING_INTERVAL_MS   =  30000;   /* SignalR {} ping  */
+/* Server KeepAliveTimeout = 20 s (from /signalr/negotiate).
+   Send our ping every 15 s so we stay within that window.
+   Only declare idle after 45 s – well beyond one server heartbeat cycle. */
+static constexpr uint32_t PING_INTERVAL_MS   =  15000;   /* SignalR {} ping  */
 static constexpr uint32_t TCP_TIMEOUT_MS     =  10000;   /* connect timeout  */
-static constexpr uint32_t READ_TIMEOUT_MS    =  15000;   /* idle WS timeout  */
+static constexpr uint32_t READ_TIMEOUT_MS    =  45000;   /* idle WS timeout  */
 
 /* ----------------------------------------------------------------
    SignalR endpoints (plain HTTP, port 80)
