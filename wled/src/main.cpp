@@ -22,6 +22,7 @@
 #include "WebUI.h"
 #include "F1NetWork.h"
 #include "F1Calendar.h"
+#include "Replay.h"
 
 /* ── AP mode credentials ────────────────────────────────────────────────── */
 static constexpr const char* AP_SSID = "F1-Lamp";
@@ -38,6 +39,7 @@ static volatile F1NetState g_pendingState = F1ST_IDLE;
 static volatile bool       g_pendingValid = false;
 
 static void onF1StateChange(F1NetState newState) {
+    if (replay_isActive() || replay_isLoading()) return;  /* replay has the floor */
     g_pendingState = newState;
     g_pendingValid = true;
 }
@@ -246,6 +248,7 @@ void setup() {
     if (sta) {
         f1net_setCallback(onF1StateChange);
         f1net_setEventCallback(onF1Event);
+        replay_setCallbacks(onF1StateChange, onF1Event);
         f1net_setup();
         xTaskCreate(
             [](void*) {
@@ -399,7 +402,8 @@ void loop() {
         }
         s_lastSt = curSt;
     }
-
+    /* ── Replay tick ────────────────────────────────────────────────── */
+    replay_tick();
     /* ── LED animation tick (skip during start-lights) ─────────────────── */
     if (g_slPhase == 0) ledfx_tick();
 

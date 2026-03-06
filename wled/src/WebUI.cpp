@@ -7,6 +7,7 @@
 #include "LedFx.h"
 #include "F1NetWork.h"
 #include "F1Calendar.h"
+#include "Replay.h"
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 #include <ArduinoJson.h>
@@ -179,6 +180,34 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
   </div>
 </div>
 
+<!-- session replay -->
+<div class="card">
+  <div style="font-weight:700;font-size:.85rem;margin-bottom:10px">&#127909; Session Replay</div>
+  <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">
+    <select id="rpYear" style="background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:4px 8px">
+      <option value="2026">2026</option>
+      <option value="2025">2025</option>
+    </select>
+    <button class="btn btn-sm" style="background:#1a3a1a;color:#6f6;border:1px solid #375" onclick="loadReplaySessions()">&#128196; Load Sessions</button>
+  </div>
+  <select id="rpSessions" style="width:100%;background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:4px 8px;margin-bottom:8px">
+    <option value="">— click Load Sessions first —</option>
+  </select>
+  <div class="row" style="gap:6px;margin-bottom:8px">
+    <label style="font-size:.75rem;color:#888">Speed:</label>
+    <select id="rpSpeed" style="background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:3px 8px">
+      <option value="1">1&times;</option>
+      <option value="5" selected>5&times;</option>
+      <option value="10">10&times;</option>
+      <option value="30">30&times;</option>
+      <option value="60">60&times;</option>
+    </select>
+    <button class="btn btn-sm" style="background:#1a3a1a;color:#6f6;border:1px solid #375" onclick="startReplay()">&#9654; Start</button>
+    <button class="btn btn-sm" style="background:#3a1a1a;color:#f66;border:1px solid #733" onclick="stopReplay()">&#9632; Stop</button>
+  </div>
+  <div id="rpStatus" style="font-size:.72rem;color:#888;min-height:1.2em">No session loaded.</div>
+</div>
+
 <!-- save / reboot -->
 <div class="card">
   <div class="row">
@@ -332,6 +361,47 @@ async function saveFeature(name,val){
 }
 async function testEvent(ev){
   await fetch('/api/test_event?ev='+ev,{method:'POST'});
+}
+
+/* ── Session Replay ── */
+let _rpPoll=null;
+async function loadReplaySessions(){
+  const yr=document.getElementById('rpYear').value;
+  document.getElementById('rpStatus').textContent='Loading sessions\u2026';
+  try{
+    const arr=await(await fetch('/api/replay/sessions?year='+yr)).json();
+    const sel=document.getElementById('rpSessions');
+    if(!arr.length){sel.innerHTML='<option>No sessions found</option>';return;}
+    sel.innerHTML=arr.map(s=>`<option value="${s.p}">${s.l}</option>`).join('');
+    document.getElementById('rpStatus').textContent=arr.length+' sessions loaded.';
+  }catch(e){document.getElementById('rpStatus').textContent='Error: '+e;}
+}
+async function startReplay(){
+  const path=document.getElementById('rpSessions').value;
+  const speed=parseFloat(document.getElementById('rpSpeed').value);
+  if(!path){document.getElementById('rpStatus').textContent='Pick a session first.';return;}
+  await fetch('/api/replay/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,speed})});
+  document.getElementById('rpStatus').textContent='Fetching streams\u2026';
+  if(_rpPoll)clearInterval(_rpPoll);
+  _rpPoll=setInterval(async()=>{
+    try{
+      const d=await(await fetch('/api/replay/status')).json();
+      if(d.loading){
+        document.getElementById('rpStatus').textContent='Fetching streams\u2026';
+      }else if(d.active){
+        const pct=d.total>0?Math.round(d.idx*100/d.total):0;
+        document.getElementById('rpStatus').textContent=`Playing \u25b6 ${d.idx}/${d.total} events  ${pct}%  (${d.speed}\u00d7)`;
+      }else{
+        document.getElementById('rpStatus').textContent='\u2705 Replay complete.';
+        clearInterval(_rpPoll);_rpPoll=null;
+      }
+    }catch(e){}
+  },1000);
+}
+async function stopReplay(){
+  await fetch('/api/replay/stop',{method:'POST'});
+  if(_rpPoll){clearInterval(_rpPoll);_rpPoll=null;}
+  document.getElementById('rpStatus').textContent='Stopped.';
 }
 
 async function scanNetworks(){
@@ -579,6 +649,43 @@ void webui_init(
         }
         out += "]";
         WiFi.scanDelete();
+        sendJson(req, out);
+    });
+
+    /* ── GET /api/replay/sessions?year=N ───────────────────────────────── */
+    s_server.on("/api/replay/sessions", HTTP_GET, [](AsyncWebServerRequest* req) {
+        int year = 2026;
+        if (req->hasParam("year")) year = req->getParam("year")->value().toInt();
+        const char* json = replay_fetchSessionsJson(year);
+        sendJson(req, json ? json : "[]");
+    });
+
+    /* ── POST /api/replay/start  body: {"path":"...","speed":10} ────────── */
+    auto rpStartHandler = new AsyncCallbackJsonWebHandler("/api/replay/start",
+        [](AsyncWebServerRequest* req, JsonVariant& json) {
+            JsonObject obj = json.as<JsonObject>();
+            const char* path = obj["path"] | "";
+            float speed = obj["speed"] | 5.0f;
+            if (path[0]) replay_start(path, speed);
+            sendOk(req);
+        });
+    s_server.addHandler(rpStartHandler);
+
+    /* ── POST /api/replay/stop ──────────────────────────────────────── */
+    s_server.on("/api/replay/stop", HTTP_POST, [](AsyncWebServerRequest* req) {
+        replay_stop();
+        sendOk(req);
+    });
+
+    /* ── GET /api/replay/status ─────────────────────────────────────── */
+    s_server.on("/api/replay/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+        JsonDocument doc;
+        doc["loading"] = replay_isLoading();
+        doc["active"]  = replay_isActive();
+        doc["idx"]     = replay_currentIdx();
+        doc["total"]   = replay_eventCount();
+        doc["speed"]   = (int)replay_speed();
+        String out; serializeJson(doc, out);
         sendJson(req, out);
     });
 
