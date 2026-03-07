@@ -8,6 +8,7 @@
 #include "F1NetWork.h"
 #include "F1Calendar.h"
 #include "Replay.h"
+#include "F1Sessions.h"
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 #include <ArduinoJson.h>
@@ -83,11 +84,14 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
 <!-- status -->
 <div class="card">
   <h2>Track Status</h2>
-  <div class="state-box" id="stateBox">—</div>
-  <div class="info-row"><span>Network</span><span id="wifiInfo">—</span></div>
+  <div class="state-box" id="stateBox">Loading…</div>
+  <div class="info-row"><span>Network</span><span id="wifiInfo">Loading…</span></div>
+  <div class="info-row"><span>IP</span><span id="ipInfo" style="font-family:monospace;font-size:.8rem">—</span></div>
+  <div class="info-row"><span>Signal</span><span id="rssiInfo">—</span></div>
   <div class="info-row"><span>F1 LiveTiming</span><span id="f1Ok">—</span></div>
   <div class="info-row" id="raceRow" style="display:none"><span>Race Week</span><span id="raceLabel" style="color:#ffc800">—</span></div>
   <div class="info-row" id="rampRow" style="display:none"><span>Idle ramp</span><span id="rampPct">—</span></div>
+  <div class="info-row"><span>Free heap</span><span id="heapInfo" style="font-size:.8rem">—</span></div>
 </div>
 
 <!-- force state -->
@@ -180,6 +184,15 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
   </div>
 </div>
 
+<!-- past sessions -->
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-weight:700;font-size:.85rem">&#127760; Past Sessions</div>
+    <button class="btn btn-sm btn-outline" id="sessBtn" onclick="loadSessions()">Load</button>
+  </div>
+  <div id="sessList" style="font-size:.78rem;color:#888;max-height:260px;overflow-y:auto">Press Load to fetch from F1 live-timing.</div>
+</div>
+
 <!-- session replay -->
 <div class="card">
   <div style="font-weight:700;font-size:.85rem;margin-bottom:10px">&#127909; Session Replay</div>
@@ -215,15 +228,23 @@ const EF=['Solid','Pulse','Spinner','Strobe','Alt Letters'];
 
 let cfg=null, briTimer=null;
 
+async function fetchWithTimeout(url,ms){
+  const c=new AbortController();
+  const t=setTimeout(()=>c.abort(),ms||5000);
+  try{return await fetch(url,{signal:c.signal});}finally{clearTimeout(t);}
+}
 async function fetchStatus(){
   try{
-    const d=await(await fetch('/api/status')).json();
+    const d=await(await fetchWithTimeout('/api/status',4000)).json();
     const idx=Math.min(d.state,SN.length-1);
     const b=SB[idx]||'#333', f=SF[idx]||'#eee';
     const sb=document.getElementById('stateBox');
     sb.textContent=SN[idx]||'Unknown';
     sb.style.background=b; sb.style.color=f;
     document.getElementById('wifiInfo').textContent=d.ssid||(d.ap?'AP: F1-Lamp':'—');
+    document.getElementById('ipInfo').textContent=d.ip||'—';
+    const rssiEl=document.getElementById('rssiInfo');
+    if(d.rssi){const rs=d.rssi;const col=rs>-60?'#00d2be':rs>-75?'#ffc800':'#e10600';rssiEl.textContent=rs+' dBm';rssiEl.style.color=col;}else{rssiEl.textContent=d.ap?'AP mode':'—';}
     document.getElementById('f1Ok').textContent=d.f1ok?'✓ Connected':'⏳ Waiting for session';
     document.getElementById('f1Ok').style.color=d.f1ok?'#00d2be':'#aaa';
     const nb=document.getElementById('netBadge');
@@ -245,7 +266,12 @@ async function fetchStatus(){
     const hasRamp=d.rampPct>0&&d.rampPct<100;
     document.getElementById('rampRow').style.display=hasRamp?'flex':'none';
     document.getElementById('rampPct').textContent=hasRamp?(d.rampPct+'%'):'';
-  }catch(e){}
+    document.getElementById('heapInfo').textContent=(d.heap/1024).toFixed(1)+' KB';
+  }catch(e){
+    document.getElementById('stateBox').textContent='⚠ Offline';
+    document.getElementById('stateBox').style.background='#333';
+    document.getElementById('stateBox').style.color='#e10600';
+  }
 }
 
 async function loadConfig(){
@@ -390,17 +416,22 @@ async function scanNetworks(){
   btn.disabled=true; btn.textContent='Scanning…';
   list.innerHTML='<span style="font-size:.75rem;color:#555">Scanning…</span>';
   try{
-    const nets=await(await fetch('/api/scan')).json();
-    list.innerHTML='';
-    if(!nets.length){list.innerHTML='<span style="font-size:.75rem;color:#555">No networks found</span>';return;}
-    nets.forEach(n=>{
-      const rssiColor=n.rssi>-60?'#00d2be':n.rssi>-75?'#ffc800':'#e10600';
-      const el=document.createElement('div');
-      el.className='net-item';
-      el.innerHTML=`<span class="rssi-dot" style="background:${rssiColor}"></span>${escHtml(n.ssid)}<span style="font-size:.7rem;color:#555">${n.rssi}dBm</span>`;
-      el.onclick=()=>{document.getElementById('wSsid').value=n.ssid;document.getElementById('wPass').focus();};
-      list.appendChild(el);
-    });
+    for(let i=0;i<30;i++){
+      const d=await(await fetch('/api/scan')).json();
+      if(d.scanning){await new Promise(r=>setTimeout(r,500));continue;}
+      list.innerHTML='';
+      if(!d.length){list.innerHTML='<span style="font-size:.75rem;color:#555">No networks found</span>';return;}
+      d.forEach(n=>{
+        const rssiColor=n.rssi>-60?'#00d2be':n.rssi>-75?'#ffc800':'#e10600';
+        const el=document.createElement('div');
+        el.className='net-item';
+        el.innerHTML=`<span class="rssi-dot" style="background:${rssiColor}"></span>${escHtml(n.ssid)}<span style="font-size:.7rem;color:#555">${n.rssi}dBm</span>`;
+        el.onclick=()=>{document.getElementById('wSsid').value=n.ssid;document.getElementById('wPass').focus();};
+        list.appendChild(el);
+      });
+      return;
+    }
+    list.innerHTML='<span style="font-size:.75rem;color:#e10600">Scan timed out</span>';
   }catch(e){list.innerHTML='<span style="font-size:.75rem;color:#e10600">Scan failed</span>';}
   finally{btn.disabled=false;btn.textContent='Scan';}
 }
@@ -409,6 +440,43 @@ function rgb2hex(r,g,b){return '#'+[r,g,b].map(x=>x.toString(16).padStart(2,'0')
 function hex2rgb(h){const n=parseInt(h.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255];}
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function showOk(id){const e=document.getElementById(id);e.style.display='inline';setTimeout(()=>e.style.display='none',2500);}
+
+/* ── Past Sessions ── */
+async function loadSessions(){
+  const btn=document.getElementById('sessBtn');
+  const list=document.getElementById('sessList');
+  btn.disabled=true;btn.textContent='Loading\u2026';
+  list.innerHTML='<span style="color:#555">Fetching from F1 server\u2026</span>';
+  try{
+    /* Poll until the ESP finishes its background TLS fetch */
+    let d;
+    for(let i=0;i<30;i++){
+      d=await(await fetch('/api/sessions')).json();
+      if(!d.loading) break;
+      await new Promise(r=>setTimeout(r,1000));
+      list.innerHTML='<span style="color:#555">Fetching from F1 server\u2026 ('+Math.round(i+1)+'s)</span>';
+    }
+    if(d.loading){list.innerHTML='<span style="color:#e10600">Timed out waiting for data.</span>';return;}
+    if(d.error){list.innerHTML='<span style="color:#e10600">Error: '+escHtml(d.error)+'</span><br><button class="btn btn-sm btn-outline" onclick="fetch(&apos;/api/sessions_debug?reset=1&apos;).then(()=>loadSessions())">Retry</button>';return;}
+    if(!d.meetings||!d.meetings.length){list.innerHTML='No sessions found.';return;}
+    let html='';
+    d.meetings.forEach(m=>{
+      html+=`<div style="margin-top:8px"><span style="color:#e10600;font-weight:700">${escHtml(m.name)}</span>`;
+      html+=` <span style="color:#555">\u2014 ${escHtml(m.location||'')}</span></div>`;
+      (m.sessions||[]).forEach(s=>{
+        const hasPath=!!s.path;
+        const icon=s.type==='Race'?'\ud83c\udfc1':s.type==='Qualifying'?'\u23f1':'\ud83d\udee0';
+        const col=hasPath?'#ccc':'#555';
+        html+=`<div style="margin-left:12px;padding:2px 0;color:${col}">`;
+        html+=`${icon} <b>${escHtml(s.name)}</b> <span style="color:#555;font-size:.7rem">${escHtml(s.date||'')}</span>`;
+        if(hasPath) html+=` <span style="color:#00d2be;font-size:.7rem">\u2713 data</span>`;
+        html+=`</div>`;
+      });
+    });
+    list.innerHTML=html;
+  }catch(e){list.innerHTML='<span style="color:#e10600">Error: '+escHtml(e.message)+'</span>';}
+  finally{btn.disabled=false;btn.textContent='Load';}
+}
 
 // ── init ─────────────────────────────────────────────────────────────────────
 (function(){
@@ -420,9 +488,11 @@ function showOk(id){const e=document.getElementById(id);e.style.display='inline'
     b.onclick=()=>forceState(i);
     g.appendChild(b);
   });
-  loadConfig();
-  loadFeatures();
-  fetchStatus();
+  /* Stagger API calls – the 22 KB page takes seconds to transfer;
+     fire status first with a small delay, then config/features.  */
+  setTimeout(fetchStatus,300);
+  setTimeout(loadConfig,800);
+  setTimeout(loadFeatures,1200);
   setInterval(fetchStatus,2000);
 })();
 </script>
@@ -445,15 +515,107 @@ static void sendOk(AsyncWebServerRequest* req) {
    Public init
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ── Lightweight WiFi-config page (~2 KB) for AP-mode use ────────────── */
+static const char WIFI_HTML[] PROGMEM = R"html(
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – WiFi Setup</title>
+<style>
+body{background:#111;color:#eee;font-family:sans-serif;margin:0;padding:20px;max-width:400px;margin:auto}
+h2{color:#e10600;margin-top:0}
+input[type=text],input[type=password]{width:100%;padding:10px;margin:6px 0 12px;background:#222;color:#eee;border:1px solid #444;border-radius:6px;box-sizing:border-box;font-size:1rem}
+button{padding:10px 20px;border:none;border-radius:6px;font-size:1rem;cursor:pointer;margin:4px 2px}
+.btn-scan{background:#333;color:#aaa;font-size:.85rem;padding:8px 14px}
+.btn-save{background:#00d2be;color:#111;font-weight:bold;width:100%}
+.net{padding:8px;border-bottom:1px solid #333;cursor:pointer}
+.net:hover{background:#222}
+.ok{color:#0c8;display:none}
+.info{color:#666;font-size:.8rem;margin-top:20px}
+</style></head><body>
+<h2>F1 Lamp WiFi</h2>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+  <label>SSID</label>
+  <button class="btn-scan" id="sb" onclick="doScan()">Scan</button>
+</div>
+<div id="nl"></div>
+<input type="text" id="ss" placeholder="Network name">
+<label>Password</label>
+<input type="password" id="pw" placeholder="WiFi password">
+<button class="btn-save" onclick="doSave()">Save &amp; Reconnect</button>
+<span class="ok" id="ok">Saved – rebooting…</span>
+<div class="info" id="di">Loading…</div>
+<script>
+async function doScan(){
+  const b=document.getElementById('sb'),l=document.getElementById('nl');
+  b.disabled=true;b.textContent='Scanning…';
+  l.innerHTML='<span style="color:#555">Scanning…</span>';
+  try{
+    /* Async scan: poll until results are ready (up to 15s) */
+    for(let i=0;i<30;i++){
+      const r=await fetch('/api/scan');const d=await r.json();
+      if(d.scanning){await new Promise(r=>setTimeout(r,500));continue;}
+      /* d is an array of networks */
+      l.innerHTML='';
+      if(!d.length){l.innerHTML='<span style="color:#555">No networks found</span>';return;}
+      d.forEach(n=>{
+        const el=document.createElement('div');el.className='net';
+        el.textContent=n.ssid+' ('+n.rssi+'dBm)';
+        el.onclick=()=>{document.getElementById('ss').value=n.ssid;document.getElementById('pw').focus();};
+        l.appendChild(el);
+      });
+      return;
+    }
+    l.innerHTML='<span style="color:#e10600">Scan timed out</span>';
+  }catch(e){l.innerHTML='<span style="color:#e10600">Scan failed: '+e.message+'</span>';}
+  finally{b.disabled=false;b.textContent='Scan';}
+}
+async function doSave(){
+  const ssid=document.getElementById('ss').value;
+  const pass=document.getElementById('pw').value;
+  if(!ssid){alert('Enter an SSID');return;}
+  try{
+    /* Try JSON POST first */
+    const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pass})});
+    if(r.ok){document.getElementById('ok').style.display='inline';return;}
+  }catch(e){}
+  /* Fallback: GET with query params (works even when JSON handler fails) */
+  try{
+    const u='/api/wifi/set?ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass);
+    const r2=await fetch(u);
+    if(r2.ok){document.getElementById('ok').style.display='inline';return;}
+  }catch(e){}
+  alert('Save failed \u2013 check connection');
+}
+try{
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    document.getElementById('di').textContent=
+      'Heap: '+(d.heap||'?')+' B  |  SSID: '+(d.ssid||'(none)')+'  |  AP: '+(d.ap?'Yes':'No');
+    if(d.ssid)document.getElementById('ss').value=d.ssid;
+  }).catch(()=>{});
+}catch(e){}
+</script></body></html>
+)html";
+
 void webui_init(
     std::function<void(uint8_t state)>   onForcedState,
     std::function<void()>                onReboot,
     std::function<void(uint8_t evType)>  onTestEvent
 ) {
-    /* ── GET /  →  single-page HTML app ────────────────────────────────── */
+    /* ── GET /  →  full UI (STA) or redirect to /wifi (AP) ─────────────── */
     s_server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (g_apMode) {
+            req->redirect("/wifi");
+            return;
+        }
         AsyncWebServerResponse* resp = req->beginResponse(
             200, "text/html", (const uint8_t*)UI_HTML, strlen_P(UI_HTML));
+        resp->addHeader("Cache-Control", "no-cache");
+        req->send(resp);
+    });
+
+    /* ── GET /wifi  →  lightweight WiFi-only setup page ────────────────── */
+    s_server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* req) {
+        AsyncWebServerResponse* resp = req->beginResponse(
+            200, "text/html", (const uint8_t*)WIFI_HTML, strlen_P(WIFI_HTML));
         resp->addHeader("Cache-Control", "no-cache");
         req->send(resp);
     });
@@ -470,6 +632,9 @@ void webui_init(
         doc["power"]     = g_cfg.power;
         doc["nextRace"]  = f1cal_hasData() ? f1cal_nextRaceLabel() : "—";
         doc["rampPct"]   = (int)(f1cal_idleFactor() * 100.0f);
+        doc["heap"]      = (int)ESP.getFreeHeap();
+        doc["ip"]        = WiFi.localIP().toString();
+        doc["rssi"]      = (int)WiFi.RSSI();
         String out; serializeJson(doc, out);
         sendJson(req, out);
     });
@@ -554,7 +719,25 @@ void webui_init(
             delay(200);
             ESP.restart();
         });
+    wifiHandler->setMethod(HTTP_POST);
     s_server.addHandler(wifiHandler);
+
+    /* ── GET /api/wifi/set?ssid=X&pass=Y  (fallback for AP mode) ─────── */
+    s_server.on("/api/wifi/set", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!req->hasParam("ssid")) { req->send(400, "text/plain", "missing ssid"); return; }
+        strlcpy(g_cfg.ssid, req->getParam("ssid")->value().c_str(), sizeof(g_cfg.ssid));
+        if (req->hasParam("pass")) {
+            const String& pv = req->getParam("pass")->value();
+            if (pv.length() > 0)
+                strlcpy(g_cfg.pass, pv.c_str(), sizeof(g_cfg.pass));
+        }
+        cfg_save();
+        req->send(200, "text/html", "<html><body style='background:#111;color:#eee;font-family:sans-serif;padding:40px;text-align:center'>"
+                   "<h2 style='color:#00d2be'>WiFi Saved!</h2><p>SSID: " + String(g_cfg.ssid) + "</p>"
+                   "<p>Rebooting in 2 seconds...</p></body></html>");
+        delay(200);
+        ESP.restart();
+    });
 
     /* ── POST /api/force?s=N ─────────────────────────────────────────────── */
     s_server.on("/api/force", HTTP_POST, [onForcedState](AsyncWebServerRequest* req) {
@@ -617,8 +800,23 @@ void webui_init(
         });
     s_server.addHandler(featHandler);
     /* ── GET /api/scan  →  JSON array of nearby WiFi networks ──────────── */
+    /* Uses async scan to avoid blocking the lwIP task (which kills the
+       async web server connection).  First GET starts the scan and returns
+       {"scanning":true}.  Client polls; once WiFi.scanComplete() >= 0
+       we return the result array.                                          */
     s_server.on("/api/scan", HTTP_GET, [](AsyncWebServerRequest* req) {
-        int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+        int n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_FAILED) {
+            /* No scan running / previous scan consumed → kick off new one */
+            WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+            sendJson(req, "{\"scanning\":true}");
+            return;
+        }
+        if (n == WIFI_SCAN_RUNNING) {
+            sendJson(req, "{\"scanning\":true}");
+            return;
+        }
+        /* n >= 0  → results ready */
         String out = "[";
         for (int i = 0; i < n; i++) {
             if (i) out += ",";
@@ -658,6 +856,46 @@ void webui_init(
         doc["speed"]   = (int)replay_speed();
         String out; serializeJson(doc, out);
         sendJson(req, out);
+    });
+
+    /* ── GET /api/sessions  →  cached F1 session index ──────────────────── */
+    s_server.on("/api/sessions", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (f1sessions_isFetching()) {
+            sendJson(req, "{\"loading\":true}");
+            return;
+        }
+        if (!f1sessions_hasData()) {
+            /* Check if we exhausted retries */
+            const String& err = f1sessions_lastError();
+            if (err.length() > 0) {
+                /* Return the error so the UI can show it */
+                String j = "{\"error\":\"" + err + "\"}";
+                sendJson(req, j);
+                return;
+            }
+            /* Kick off a background fetch (picked up by the f1net task
+               so we don't run concurrent TLS). */
+            f1sessions_requestFetch();
+            sendJson(req, "{\"loading\":true}");
+            return;
+        }
+        sendJson(req, f1sessions_json());
+    });
+
+    /* ── GET /api/sessions_debug  →  diagnostic info ────────────────────── */
+    s_server.on("/api/sessions_debug", HTTP_GET, [](AsyncWebServerRequest* req) {
+        /* If ?reset is present, clear the retry counter */
+        if (req->hasParam("reset")) {
+            f1sessions_resetRetries();
+            f1sessions_clear();
+        }
+        String j = "{\"fetching\":" + String(f1sessions_isFetching() ? "true" : "false")
+                 + ",\"hasData\":" + String(f1sessions_hasData() ? "true" : "false")
+                 + ",\"requested\":" + String(f1sessions_fetchRequested() ? "true" : "false")
+                 + ",\"error\":\"" + f1sessions_lastError() + "\""
+                 + ",\"heap\":" + String(ESP.getFreeHeap())
+                 + "}";
+        sendJson(req, j);
     });
 
     /* ── POST /api/test_event?ev=N  (0=winner 1=fastest_lap 2=drs 3=start_lights) ─── */

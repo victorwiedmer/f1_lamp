@@ -37,9 +37,48 @@
 #undef  MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
 #define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
 
-/* Cipher-suite table */
-#undef  MBEDTLS_SSL_CIPHERSUITES
-#define MBEDTLS_SSL_CIPHERSUITES   MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+/* ---- Crypto modules compiled out by SDK, re-enabled + compiled from source ---- */
+
+/* AES block cipher (needed by GCM, CBC cipher suites) */
+#undef  MBEDTLS_AES_C
+#define MBEDTLS_AES_C
+
+/* GCM authenticated-encryption mode (AEAD) */
+#undef  MBEDTLS_GCM_C
+#define MBEDTLS_GCM_C
+
+/* Elliptic-Curve Diffie-Hellman (key exchange) */
+#undef  MBEDTLS_ECDH_C
+#define MBEDTLS_ECDH_C
+
+/* Elliptic-curve point arithmetic (required by ECDH) */
+#undef  MBEDTLS_ECP_C
+#define MBEDTLS_ECP_C
+
+/* SECP256R1 is the most common curve for TLS 1.2 */
+#undef  MBEDTLS_ECP_DP_SECP256R1_ENABLED
+#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
+
+/* Also enable secp384r1 as a fallback */
+#undef  MBEDTLS_ECP_DP_SECP384R1_ENABLED
+#define MBEDTLS_ECP_DP_SECP384R1_ENABLED
+
+/* NIST curve optimisations */
+#undef  MBEDTLS_ECP_NIST_OPTIM
+#define MBEDTLS_ECP_NIST_OPTIM
+
+/* ---- Key-exchange algorithms ---- */
+
+/* ECDHE-RSA: server cert=RSA, ephemeral ECDH key-exchange (most common) */
+#undef  MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+
+/* Plain RSA key exchange as fallback */
+#undef  MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
+
+/* Cipher-suite table: let mbedtls negotiate from all compiled suites.
+   Do NOT define MBEDTLS_SSL_CIPHERSUITES – use the full default list. */
 
 /* Content length (use whatever the SDK configured; do not redefine) */
 #undef  MBEDTLS_SSL_MAX_CONTENT_LEN

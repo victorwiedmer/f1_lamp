@@ -32,6 +32,7 @@ extern "C" {
 }
 
 #include "F1NetWork.h"
+#include "F1Sessions.h"
 
 /* For select() / fd_set on ESP-IDF */
 #include <sys/select.h>
@@ -77,6 +78,8 @@ static unsigned long s_lastConnect = 0;
 static unsigned long s_lastPing    = 0;
 static unsigned long s_lastData    = 0;  /* last ws frame received */
 static bool        s_sessionActive = false;
+static int         s_connFails    = 2;   /* start disabled – esp_tls has TLS compiled out, crashes on connect */
+static constexpr int MAX_CONN_FAILS = 2; /* stop retrying after this many    */
 
 /* AWS ALB cookies captured during negotiate, forwarded to WS upgrade */
 static char s_cookies[512] = {};
@@ -687,11 +690,20 @@ static void connectSignalR()
 {
     if (WiFi.status() != WL_CONNECTED) return;
 
+    /* esp_tls has TLS compiled out (CONFIG_MBEDTLS_TLS_DISABLED).  Each failed
+       attempt blocks TCP for ~10 s, starving the web server.  After a couple of
+       failures give up so the UI stays responsive.  Will be removed when
+       F1NetWork moves to raw mbedtls.  */
+    if (s_connFails >= MAX_CONN_FAILS) return;
+
     /* Static: avoids 3 KB of stack. Safe – only called from single f1net task. */
     static char token[1024];
     static char tokenEnc[2048];
     token[0] = '\0';
     if (!negotiate(token, sizeof(token))) {
+        s_connFails++;
+        if (s_connFails >= MAX_CONN_FAILS)
+            Serial.println("[F1Net] TLS appears broken – suspending retries");
         scheduleReconnect();
         return;
     }
@@ -699,10 +711,14 @@ static void connectSignalR()
     url_encode(token, tokenEnc, sizeof(tokenEnc));
 
     if (!wsConnect(tokenEnc)) {
+        s_connFails++;
+        if (s_connFails >= MAX_CONN_FAILS)
+            Serial.println("[F1Net] TLS appears broken – suspending retries");
         scheduleReconnect();
         return;
     }
 
+    s_connFails = 0;  /* reset on success */
     s_wsOpen    = true;
     s_connected = true;
     s_lastPing  = millis();
@@ -730,6 +746,27 @@ void f1net_setup(void)
 void f1net_loop(void)
 {
     if (WiFi.status() != WL_CONNECTED) return;
+
+    /* ── Sessions fetch request ──────────────────────────────────────────
+       The WebUI sets a flag via f1sessions_requestFetch().  We handle it
+       here so there is only ONE TLS connection at a time – opening a
+       second one would exhaust the lwIP socket pool on ESP32-C3 and
+       block the AsyncWebServer from sending any responses.              */
+    if (f1sessions_fetchRequested()) {
+        Serial.println("[F1Net] Sessions fetch requested – tearing down WS");
+        if (s_tls) {
+            esp_tls_conn_destroy(s_tls);
+            s_tls = nullptr;
+        }
+        s_wsOpen    = false;
+        s_connected = false;
+        /* Blocking fetch – reuses this task's stack, one TLS conn at a time */
+        f1sessions_fetch();
+        /* Schedule reconnect after a short delay */
+        s_lastConnect = millis();
+        s_reconnDelay = RECONNECT_INIT_MS;
+        return;
+    }
 
     if (!s_wsOpen) {
         unsigned long now = millis();

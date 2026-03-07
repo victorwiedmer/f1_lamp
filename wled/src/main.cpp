@@ -112,7 +112,7 @@ static bool connectSTA() {
         delay(500);
         WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK); /* force WPA2 – avoids WPA3 4-way handshake timeout */
         WiFi.begin(g_cfg.ssid, g_cfg.pass);
-        WiFi.setTxPower(WIFI_POWER_5dBm); /* workaround: C3 SuperMini broken antenna */
+        WiFi.setTxPower(WIFI_POWER_8_5dBm); /* C3 SuperMini broken antenna */
 
         uint32_t t0 = millis();
         while (WiFi.status() != WL_CONNECTED) {
@@ -255,18 +255,26 @@ void setup() {
         f1net_setEventCallback(onF1Event);
         replay_setCallbacks(applyState, onF1Event);
         f1net_setup();
+        static TaskHandle_t s_f1netTask = nullptr;
         xTaskCreate(
             [](void*) {
+                uint32_t loopCnt = 0;
                 for (;;) {
                     f1net_loop();
                     vTaskDelay(pdMS_TO_TICKS(10));
+                    /* Log stack high-water mark every ~60s */
+                    if (++loopCnt % 6000 == 0) {
+                        UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
+                        Serial.printf("[f1net] stack HWM=%u words (%u bytes free)\n",
+                                      hwm, hwm * sizeof(StackType_t));
+                    }
                 }
             },
             "f1net",   /* task name  */
-            12288,     /* stack (bytes) – large enough for lwIP + SignalR    */
+            20480,     /* stack (bytes) – TlsConn is heap-allocated; 20 KB enough */
             nullptr,
             1,         /* priority 1 (idle+1) – below loop() at priority 1? */
-            nullptr
+            &s_f1netTask
         );
         Serial.println("[F1Lamp] F1 network task started");
         LOG("[F1Lamp] F1 network task started\n");
@@ -335,7 +343,7 @@ void loop() {
             WiFi.disconnect(false);
             WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
             WiFi.begin(g_cfg.ssid, g_cfg.pass);
-            WiFi.setTxPower(WIFI_POWER_5dBm);
+            WiFi.setTxPower(WIFI_POWER_8_5dBm);
         }
     }
 
