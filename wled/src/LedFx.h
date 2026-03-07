@@ -53,6 +53,21 @@ void ledfx_allOff();
    Safe to call from loop() context.  Resets any active flash timer if called again. */
 void ledfx_flashEffect(uint8_t r, uint8_t g, uint8_t b, uint16_t durationMs);
 
+/* Start lights countdown – set which phase (1-5=lights, 0=off). */
+void ledfx_setStartLightsPhase(uint8_t phase);
+
+/* Information about the currently running effect. */
+struct LedFxInfo {
+    uint8_t effect;     /* 0-5 */
+    uint8_t r, g, b;    /* primary color */
+    uint8_t r2, g2, b2; /* secondary color */
+    uint8_t speed;
+    bool    flashing;   /* true if a flash overlay is active */
+};
+
+/* Retrieve current effect parameters (thread-safe snapshot). */
+LedFxInfo ledfx_getActiveEffect();
+
 /* Directly set the strip to show N of 5 "start lights" (red).
    phase 0 = all off, phase 1–5 = progressively more LEDs lit.
    Calls FastLED.show() immediately (bypasses tick). */

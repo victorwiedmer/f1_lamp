@@ -28,6 +28,11 @@ static float         s_speed     = 5.0f;
 static uint32_t      s_startMs   = 0;
 
 /* ──────────────────────────────────────────────────────────────────────────
+   Last-event snapshot (read from web handler, written in loop context)
+   ────────────────────────────────────────────────────────────────────────── */
+static ReplayLastEvent s_lastEv = {};
+
+/* ──────────────────────────────────────────────────────────────────────────
    Callbacks
    ────────────────────────────────────────────────────────────────────────── */
 static F1NetStateCB s_stateCB  = nullptr;
@@ -59,6 +64,12 @@ static void dispatchEvent(const ReplayEvent& ev)
     unsigned s = (ev.ts_ms % 60000) / 1000;
     Serial.printf("[Replay] %02u:%02u  %s  \"%s\"\n",
                   m, s, TOPIC_NAMES[ev.topic], ev.data);
+
+    /* snapshot for the web UI */
+    s_lastEv.valid = true;
+    s_lastEv.ts_ms = ev.ts_ms;
+    s_lastEv.topic = ev.topic;
+    strlcpy(s_lastEv.data, ev.data, sizeof(s_lastEv.data));
 
     if (ev.topic == 0) {
         static const struct { char code; F1NetState st; } kMap[] = {
@@ -164,6 +175,21 @@ void replay_start(float speed)
     }
 }
 
+void replay_startFromEvents(ReplayEvent* events, int count, float speed)
+{
+    replay_stop();
+    if (!events || count <= 0) return;
+    s_events     = events;
+    s_eventCount = count;
+    qsort(s_events, s_eventCount, sizeof(ReplayEvent), cmpEvent);
+    s_eventIdx   = 0;
+    s_speed      = (speed < 0.1f) ? 1.0f : speed;
+    s_startMs    = millis();
+    s_active     = true;
+    Serial.printf("[Replay] Session replay: %d events  %.0fx\n",
+                  (int)s_eventCount, s_speed);
+}
+
 void replay_stop()
 {
     s_active  = false;
@@ -171,6 +197,7 @@ void replay_stop()
     if (s_events) { free(s_events); s_events = nullptr; }
     s_eventCount = 0;
     s_eventIdx   = 0;
+    s_lastEv = {};
 }
 
 bool  replay_isLoading()   { return s_loading; }
@@ -178,6 +205,24 @@ bool  replay_isActive()    { return s_active;  }
 int   replay_eventCount()  { return s_eventCount; }
 int   replay_currentIdx()  { return s_eventIdx;   }
 float replay_speed()       { return s_speed; }
+
+ReplayLastEvent replay_lastEvent()
+{
+    ReplayLastEvent e = s_lastEv;
+    /* compute simulation time */
+    if (s_active && s_startMs) {
+        e.simMs = (uint32_t)((uint64_t)(millis() - s_startMs) * (uint32_t)(s_speed * 100) / 100);
+    } else {
+        e.simMs = 0;
+    }
+    /* total session duration = last event timestamp */
+    if (s_events && s_eventCount > 0) {
+        e.totalMs = s_events[s_eventCount - 1].ts_ms;
+    } else {
+        e.totalMs = 0;
+    }
+    return e;
+}
 
 void replay_tick()
 {

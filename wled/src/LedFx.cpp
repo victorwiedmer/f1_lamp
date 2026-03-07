@@ -99,6 +99,20 @@ void ledfx_setBrightness(uint8_t bri) {
     FastLED.setBrightness(bri);
 }
 
+LedFxInfo ledfx_getActiveEffect() {
+    LedFxInfo info;
+    info.effect   = s_effect;
+    info.r        = s_color.r;
+    info.g        = s_color.g;
+    info.b        = s_color.b;
+    info.r2       = s_color2.r;
+    info.g2       = s_color2.g;
+    info.b2       = s_color2.b;
+    info.speed    = s_speed;
+    info.flashing = (s_flashEndMs != 0 && millis() < s_flashEndMs);
+    return info;
+}
+
 void ledfx_setCount(uint16_t count) {
     fill_solid(s_leds, MAX_LEDS, CRGB::Black);
     s_count   = (count > MAX_LEDS) ? MAX_LEDS : count;

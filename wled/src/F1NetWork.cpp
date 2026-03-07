@@ -768,6 +768,21 @@ void f1net_loop(void)
         return;
     }
 
+    /* ── Session replay fetch request ────────────────────────────────── */
+    if (f1sessions_replayRequested()) {
+        Serial.println("[F1Net] Replay fetch requested – tearing down WS");
+        if (s_tls) {
+            esp_tls_conn_destroy(s_tls);
+            s_tls = nullptr;
+        }
+        s_wsOpen    = false;
+        s_connected = false;
+        f1sessions_fetchAndReplay();
+        s_lastConnect = millis();
+        s_reconnDelay = RECONNECT_INIT_MS;
+        return;
+    }
+
     if (!s_wsOpen) {
         unsigned long now = millis();
         if (now - s_lastConnect >= s_reconnDelay) {

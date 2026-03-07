@@ -92,6 +92,19 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
   <div class="info-row" id="raceRow" style="display:none"><span>Race Week</span><span id="raceLabel" style="color:#ffc800">—</span></div>
   <div class="info-row" id="rampRow" style="display:none"><span>Idle ramp</span><span id="rampPct">—</span></div>
   <div class="info-row"><span>Free heap</span><span id="heapInfo" style="font-size:.8rem">—</span></div>
+  <div id="effDetail" style="margin-top:10px;padding:10px;background:#222;border-radius:8px;display:none">
+    <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:6px">Current Effect</div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span id="effName" style="font-size:.85rem;font-weight:700;color:#ccc"></span>
+      <div style="display:flex;gap:3px;align-items:center">
+        <div id="effSwatch" style="width:22px;height:22px;border-radius:4px;border:1px solid #444"></div>
+        <div id="effSwatch2" style="width:22px;height:22px;border-radius:4px;border:1px solid #444;display:none"></div>
+      </div>
+      <span id="effSpd" style="font-size:.72rem;color:#666"></span>
+      <span id="effTag" style="font-size:.65rem;padding:2px 6px;border-radius:10px;display:none"></span>
+    </div>
+    <div id="effHex" style="font-size:.68rem;color:#555;margin-top:5px;font-family:monospace"></div>
+  </div>
 </div>
 
 <!-- force state -->
@@ -208,7 +221,22 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
     <button class="btn btn-sm" style="background:#1a3a1a;color:#6f6;border:1px solid #375" onclick="startReplay()">&#9654; Start</button>
     <button class="btn btn-sm" style="background:#3a1a1a;color:#f66;border:1px solid #733" onclick="stopReplay()">&#9632; Stop</button>
   </div>
-  <div id="rpStatus" style="font-size:.72rem;color:#888;min-height:1.2em">Plays a built-in demo race from flash.</div>
+  <div id="rpStatus" style="font-size:.72rem;color:#888;min-height:1.2em">Select speed, then press Start (built-in demo) or &#9654; on a session above.</div>
+  <!-- replay live detail -->
+  <div id="rpDetail" style="display:none;margin-top:8px">
+    <div style="background:#191919;border-radius:6px;padding:8px;margin-bottom:6px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <div id="rpStateBadge" style="font-size:.8rem;font-weight:700;padding:4px 10px;border-radius:5px;background:#333;color:#aaa">Idle</div>
+        <span id="rpTime" style="font-size:.72rem;color:#555;font-family:monospace">00:00 / 00:00</span>
+        <span id="rpPct" style="font-size:.68rem;color:#555;margin-left:auto">0%</span>
+      </div>
+      <div style="background:#2a2a2a;border-radius:3px;height:4px;overflow:hidden">
+        <div id="rpBar" style="height:100%;background:#e10600;width:0%;transition:width .8s"></div>
+      </div>
+    </div>
+    <div style="font-size:.6rem;text-transform:uppercase;letter-spacing:1px;color:#444;margin-bottom:3px">Event Log</div>
+    <div id="rpLog" style="font-size:.7rem;color:#777;max-height:150px;overflow-y:auto;font-family:monospace;background:#151515;border-radius:5px;padding:5px 7px"></div>
+  </div>
 </div>
 
 <!-- save / reboot -->
@@ -226,7 +254,7 @@ const SB=['#2a2a2a','#00c800','#00c800','#ffc800','#ffc800','#ff6400','#e10600',
 const SF=['#aaa','#000','#000','#000','#000','#000','#fff','#000','#000','#000'];
 const EF=['Solid','Pulse','Spinner','Strobe','Alt Letters'];
 
-let cfg=null, briTimer=null;
+let cfg=null, briTimer=null, sessionPaths=[];
 
 async function fetchWithTimeout(url,ms){
   const c=new AbortController();
@@ -267,6 +295,27 @@ async function fetchStatus(){
     document.getElementById('rampRow').style.display=hasRamp?'flex':'none';
     document.getElementById('rampPct').textContent=hasRamp?(d.rampPct+'%'):'';
     document.getElementById('heapInfo').textContent=(d.heap/1024).toFixed(1)+' KB';
+    /* current effect detail */
+    const ep=document.getElementById('effDetail');
+    if(d.eff){
+      ep.style.display='block';
+      const EN=['Solid','Pulse','Spinner','Strobe','Alt Letters','Rainbow Spin'];
+      const eName=EN[d.eff.e]||('Effect '+d.eff.e);
+      document.getElementById('effName').textContent=eName;
+      const c1=rgb2hex(d.eff.r,d.eff.g,d.eff.b);
+      document.getElementById('effSwatch').style.background=c1;
+      const s2=document.getElementById('effSwatch2');
+      if(d.eff.e===4){s2.style.display='inline-block';s2.style.background=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2);}else{s2.style.display='none';}
+      document.getElementById('effSpd').textContent='Speed: '+d.eff.spd;
+      const tag=document.getElementById('effTag');
+      if(d.eff.fl){tag.style.display='inline';tag.textContent='\u26a1 Flash';tag.style.background='#3a2a00';tag.style.color='#ffc800';}
+      else if(d.eff.rp){tag.style.display='inline';tag.textContent='\u25b6 Replay';tag.style.background='#1a3a1a';tag.style.color='#6f6';}
+      else{tag.style.display='none';}
+      const hexA=c1.toUpperCase();
+      let hexTxt='Color: '+hexA+' ('+d.eff.r+','+d.eff.g+','+d.eff.b+')';
+      if(d.eff.e===4){const c2=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2).toUpperCase();hexTxt+='  /  '+c2+' ('+d.eff.r2+','+d.eff.g2+','+d.eff.b2+')';}
+      document.getElementById('effHex').textContent=hexTxt;
+    }else{ep.style.display='none';}
   }catch(e){
     document.getElementById('stateBox').textContent='⚠ Offline';
     document.getElementById('stateBox').style.background='#333';
@@ -381,33 +430,90 @@ async function testEvent(ev){
 
 /* ── Session Replay ── */
 let _rpPoll=null;
-
+const TOPICS=['TrackStatus','SessionStatus','RaceControl'];
+const TRACK_CODES={'1':'Green','2':'Yellow','4':'Safety Car','5':'Red Flag','6':'VSC','7':'VSC Ending'};
+const SESS_MAP={'Started':'Session Start','Finished':'Chequered','Ends':'Chequered','Inactive':'Idle'};
+let _rpLogLines=[];
+function msToTime(ms){const m=Math.floor(ms/60000),s=Math.floor((ms%60000)/1000);return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
+function evToLabel(topic,data){
+  if(topic===0){return TRACK_CODES[data]||('Track:'+data);}
+  if(topic===1){for(const[k,v]of Object.entries(SESS_MAP)){if(data.includes(k))return v;}return 'Session:'+data;}
+  if(data==='FL')return 'Fastest Lap';
+  if(data==='DRS')return 'DRS Enabled';
+  return data;
+}
+function evToStateIdx(topic,data){
+  if(topic===0){const m={'1':2,'2':3,'4':4,'5':6,'6':5,'7':8};return m[data]??-1;}
+  if(topic===1){if(data.includes('Started'))return 1;if(data.includes('Finished')||data.includes('Ends'))return 7;if(data.includes('Inactive'))return 0;}
+  return -1;
+}
+function pollReplay(){
+  if(_rpPoll)clearInterval(_rpPoll);
+  _rpLogLines=[];
+  document.getElementById('rpLog').innerHTML='';
+  document.getElementById('rpDetail').style.display='block';
+  _rpPoll=setInterval(async()=>{
+    try{
+      const d=await(await fetch('/api/replay/status')).json();
+      if(d.loading){
+        document.getElementById('rpStatus').textContent='Fetching session data\u2026';
+        return;
+      }
+      if(d.active){
+        const pct=d.total>0?Math.round(d.idx*100/d.total):0;
+        document.getElementById('rpStatus').textContent=`Playing \u25b6 ${d.idx}/${d.total} events  (${d.speed}\u00d7)`;
+        document.getElementById('rpBar').style.width=pct+'%';
+        document.getElementById('rpPct').textContent=pct+'%';
+        if(d.ev){
+          const simT=msToTime(d.ev.simMs);
+          const totT=msToTime(d.ev.totalMs);
+          document.getElementById('rpTime').textContent=simT+' / '+totT;
+          const label=evToLabel(d.ev.topic,d.ev.data);
+          const si=evToStateIdx(d.ev.topic,d.ev.data);
+          const badge=document.getElementById('rpStateBadge');
+          if(si>=0){badge.textContent=SN[si];badge.style.background=SB[si];badge.style.color=SF[si];}
+          else{badge.textContent=label;badge.style.background='#2a1a3a';badge.style.color='#c080ff';}
+          /* add to log if new */
+          const line=msToTime(d.ev.ts)+' '+TOPICS[d.ev.topic]+': '+label;
+          if(_rpLogLines.length===0||_rpLogLines[_rpLogLines.length-1]!==line){
+            _rpLogLines.push(line);
+            const log=document.getElementById('rpLog');
+            const col=si>=0?SB[si]:(d.ev.topic===2?'#c080ff':'#888');
+            log.innerHTML+=`<div style="color:${col}">${escHtml(line)}</div>`;
+            log.scrollTop=log.scrollHeight;
+          }
+        }
+      }else{
+        document.getElementById('rpStatus').textContent='\u2705 Replay complete.';
+        document.getElementById('rpBar').style.width='100%';
+        document.getElementById('rpPct').textContent='100%';
+        clearInterval(_rpPoll);_rpPoll=null;
+      }
+    }catch(e){}
+  },800);
+}
 async function startReplay(){
   const speed=parseFloat(document.getElementById('rpSpeed').value);
   document.getElementById('rpStatus').textContent='Starting replay\u2026';
   try{
     await fetch('/api/replay/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed})});
   }catch(e){document.getElementById('rpStatus').textContent='Error: '+e.message;return;}
-  if(_rpPoll)clearInterval(_rpPoll);
-  _rpPoll=setInterval(async()=>{
-    try{
-      const d=await(await fetch('/api/replay/status')).json();
-      if(d.loading){
-        document.getElementById('rpStatus').textContent='Loading\u2026';
-      }else if(d.active){
-        const pct=d.total>0?Math.round(d.idx*100/d.total):0;
-        document.getElementById('rpStatus').textContent=`Playing \u25b6 ${d.idx}/${d.total} events  ${pct}%  (${d.speed}\u00d7)`;
-      }else{
-        document.getElementById('rpStatus').textContent='\u2705 Replay complete.';
-        clearInterval(_rpPoll);_rpPoll=null;
-      }
-    }catch(e){}
-  },1000);
+  pollReplay();
+}
+async function startSessionReplay(idx){
+  const path=sessionPaths[idx];if(!path)return;
+  const speed=parseFloat(document.getElementById('rpSpeed').value);
+  document.getElementById('rpStatus').textContent='Fetching session streams\u2026';
+  try{
+    await fetch('/api/replay/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,speed})});
+  }catch(e){document.getElementById('rpStatus').textContent='Error: '+e.message;return;}
+  pollReplay();
 }
 async function stopReplay(){
   await fetch('/api/replay/stop',{method:'POST'});
   if(_rpPoll){clearInterval(_rpPoll);_rpPoll=null;}
   document.getElementById('rpStatus').textContent='Stopped.';
+  document.getElementById('rpDetail').style.display='none';
 }
 
 async function scanNetworks(){
@@ -446,6 +552,7 @@ async function loadSessions(){
   const btn=document.getElementById('sessBtn');
   const list=document.getElementById('sessList');
   btn.disabled=true;btn.textContent='Loading\u2026';
+  sessionPaths=[];
   list.innerHTML='<span style="color:#555">Fetching from F1 server\u2026</span>';
   try{
     /* Poll until the ESP finishes its background TLS fetch */
@@ -469,7 +576,7 @@ async function loadSessions(){
         const col=hasPath?'#ccc':'#555';
         html+=`<div style="margin-left:12px;padding:2px 0;color:${col}">`;
         html+=`${icon} <b>${escHtml(s.name)}</b> <span style="color:#555;font-size:.7rem">${escHtml(s.date||'')}</span>`;
-        if(hasPath) html+=` <span style="color:#00d2be;font-size:.7rem">\u2713 data</span>`;
+        if(hasPath){const pi=sessionPaths.length;sessionPaths.push(s.path);html+=` <button class="btn btn-sm" style="font-size:.6rem;padding:1px 6px;background:#003a35;color:#00d2be;border:1px solid #005a4e;cursor:pointer" onclick="startSessionReplay(${pi})">&#9654; Replay</button>`;}
         html+=`</div>`;
       });
     });
@@ -635,6 +742,15 @@ void webui_init(
         doc["heap"]      = (int)ESP.getFreeHeap();
         doc["ip"]        = WiFi.localIP().toString();
         doc["rssi"]      = (int)WiFi.RSSI();
+        /* active effect details */
+        LedFxInfo fx = ledfx_getActiveEffect();
+        JsonObject eff = doc["eff"].to<JsonObject>();
+        eff["e"]  = fx.effect;
+        eff["r"]  = fx.r;  eff["g"]  = fx.g;  eff["b"]  = fx.b;
+        eff["r2"] = fx.r2; eff["g2"] = fx.g2; eff["b2"] = fx.b2;
+        eff["spd"] = fx.speed;
+        eff["fl"]  = fx.flashing;
+        eff["rp"]  = replay_isActive();
         String out; serializeJson(doc, out);
         sendJson(req, out);
     });
@@ -849,14 +965,38 @@ void webui_init(
     /* ── GET /api/replay/status ─────────────────────────────────────── */
     s_server.on("/api/replay/status", HTTP_GET, [](AsyncWebServerRequest* req) {
         JsonDocument doc;
-        doc["loading"] = replay_isLoading();
+        doc["loading"] = replay_isLoading() || f1sessions_isReplayFetching();
         doc["active"]  = replay_isActive();
         doc["idx"]     = replay_currentIdx();
         doc["total"]   = replay_eventCount();
         doc["speed"]   = (int)replay_speed();
+        /* last event details */
+        ReplayLastEvent le = replay_lastEvent();
+        if (le.valid) {
+            JsonObject ev   = doc["ev"].to<JsonObject>();
+            ev["ts"]        = le.ts_ms;
+            ev["topic"]     = le.topic;
+            ev["data"]      = le.data;
+            ev["simMs"]     = le.simMs;
+            ev["totalMs"]   = le.totalMs;
+        }
         String out; serializeJson(doc, out);
         sendJson(req, out);
     });
+
+    /* ── POST /api/replay/session  body: {"path":"...","speed":5} ──── */
+    auto rpSessHandler = new AsyncCallbackJsonWebHandler("/api/replay/session",
+        [](AsyncWebServerRequest* req, JsonVariant& json) {
+            const char* path = json["path"] | "";
+            float speed = json["speed"] | 5.0f;
+            if (!path || !path[0]) {
+                req->send(400, "application/json", "{\"error\":\"missing path\"}");
+                return;
+            }
+            f1sessions_requestReplay(path, speed);
+            sendOk(req);
+        });
+    s_server.addHandler(rpSessHandler);
 
     /* ── GET /api/sessions  →  cached F1 session index ──────────────────── */
     s_server.on("/api/sessions", HTTP_GET, [](AsyncWebServerRequest* req) {

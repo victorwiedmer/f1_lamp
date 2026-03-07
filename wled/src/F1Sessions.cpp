@@ -14,6 +14,9 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 
+/* Replay engine – for replay_startFromEvents() */
+#include "Replay.h"
+
 /* mbedtls */
 #include "mbedtls/ssl.h"
 #include "mbedtls/ctr_drbg.h"
@@ -435,3 +438,216 @@ void f1sessions_requestFetch(int year)
 const String& f1sessions_lastError() { return s_lastError; }
 
 void f1sessions_resetRetries() { s_retries = 0; s_lastError = ""; }
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Session Replay – fetch .jsonStream files, parse events, start replay
+   ═════════════════════════════════════════════════════════════════════════ */
+
+static char     s_replayPath[160]  = "";
+static float    s_replaySpeed      = 5.0f;
+static volatile bool s_replayRequested = false;
+static volatile bool s_replayFetching  = false;
+
+void f1sessions_requestReplay(const char* sessionPath, float speed)
+{
+    if (s_fetching || s_replayRequested || s_replayFetching) return;
+    strlcpy(s_replayPath, sessionPath, sizeof(s_replayPath));
+    s_replaySpeed = speed;
+    s_replayRequested = true;
+    Serial.printf("[F1Sess] Replay requested: %s @ %.0fx\n", sessionPath, speed);
+}
+
+bool f1sessions_replayRequested()   { return s_replayRequested; }
+bool f1sessions_isReplayFetching()  { return s_replayFetching || s_replayRequested; }
+
+/* ── Timestamp parser: "HH:MM:SS.fff" → milliseconds ─────────────────── */
+static uint32_t parseStreamTs(const char* p, int len)
+{
+    int h = 0, m = 0, s = 0, ms = 0;
+    char buf[18];
+    int n = (len < 17) ? len : 17;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    /* sscanf handles "12:34:56.789" and also "0:00:00.0" gracefully */
+    sscanf(buf, "%d:%d:%d.%d", &h, &m, &s, &ms);
+    /* normalise fractional part to 3 digits */
+    if      (ms > 0 && ms < 10)  ms *= 100;
+    else if (ms >= 10 && ms < 100) ms *= 10;
+    return (uint32_t)(h * 3600000UL + m * 60000UL + s * 1000UL + ms);
+}
+
+/* ── Parse one .jsonStream body into ReplayEvents ─────────────────────── */
+static int parseStreamLines(const String& body, uint8_t topic,
+                            ReplayEvent* events, int maxEvents, int startIdx)
+{
+    int count = startIdx;
+    const char* p   = body.c_str();
+    const char* end = p + body.length();
+
+    while (p < end && count < maxEvents) {
+        /* find end of line */
+        const char* eol = (const char*)memchr(p, '\n', end - p);
+        if (!eol) eol = end;
+        int lineLen = eol - p;
+        if (lineLen < 5) { p = eol + 1; continue; }
+
+        /* find opening brace (start of JSON payload) */
+        const char* brace = (const char*)memchr(p, '{', lineLen);
+        if (!brace) { p = eol + 1; continue; }
+
+        uint32_t ts = parseStreamTs(p, brace - p);
+        int payloadLen = eol - brace;
+
+        if (topic <= 1) {
+            /* TrackStatus (0) / SessionStatus (1) – extract "Status":"value" */
+            const char* marker = "\"Status\":\"";
+            const int  mLen = 10;
+            const char* found = nullptr;
+            for (const char* s = brace; s + mLen < eol; s++) {
+                if (memcmp(s, marker, mLen) == 0) { found = s; break; }
+            }
+            if (found) {
+                const char* vs = found + mLen;
+                const char* ve = (const char*)memchr(vs, '"', eol - vs);
+                if (ve && (ve - vs) < (int)sizeof(events[0].data)) {
+                    events[count].ts_ms = ts;
+                    events[count].topic = topic;
+                    int vlen = ve - vs;
+                    memcpy(events[count].data, vs, vlen);
+                    events[count].data[vlen] = '\0';
+                    count++;
+                }
+            }
+        } else {
+            /* RaceControlMessages – keyword search, no JSON parse needed */
+            char buf[512];
+            int n = (payloadLen < 511) ? payloadLen : 511;
+            memcpy(buf, brace, n);
+            buf[n] = '\0';
+            for (int i = 0; i < n; i++)
+                if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] -= 32;
+
+            if (strstr(buf, "FASTEST LAP") && count < maxEvents) {
+                events[count].ts_ms = ts;
+                events[count].topic = 2;
+                strlcpy(events[count].data, "FL", sizeof(events[0].data));
+                count++;
+            }
+            if (strstr(buf, "DRS") && strstr(buf, "ENABLED") && count < maxEvents) {
+                events[count].ts_ms = ts;
+                events[count].topic = 2;
+                strlcpy(events[count].data, "DRS", sizeof(events[0].data));
+                count++;
+            }
+        }
+        p = eol + 1;
+    }
+    return count;
+}
+
+/* ── Fetch one .jsonStream file and extract its body ──────────────────── */
+static String fetchOneStream(const char* streamPath)
+{
+    TlsConn* cp = new (std::nothrow) TlsConn;
+    if (!cp) return String();
+    if (!tls_connect(*cp, HOST, PORT_STR)) {
+        delete cp;
+        return String();
+    }
+    String req = String("GET /static/") + streamPath + " HTTP/1.1\r\n"
+               + "Host: " + HOST + "\r\n"
+               + "Accept: */*\r\n"
+               + "Connection: close\r\n\r\n";
+    if (!tls_write_all(*cp, req.c_str(), req.length())) {
+        tls_cleanup(*cp); delete cp;
+        return String();
+    }
+    String raw = tls_read_all(*cp);
+    tls_cleanup(*cp); delete cp;
+
+    if (raw.length() == 0) return String();
+
+    /* Split headers / body */
+    int sep = raw.indexOf("\r\n\r\n");
+    if (sep < 0) return String();
+    String headers = raw.substring(0, sep);
+    String body    = raw.substring(sep + 4);
+    raw = String();
+
+    if (headers.indexOf("200") < 0) return String();   /* 404 = no data */
+
+    /* Dechunk if needed */
+    if (headers.indexOf("chunked") >= 0) {
+        String dc; dc.reserve(body.length());
+        int pos = 0;
+        while (pos < (int)body.length()) {
+            int nl = body.indexOf("\r\n", pos);
+            if (nl < 0) break;
+            unsigned long cl = strtoul(body.c_str() + pos, nullptr, 16);
+            if (cl == 0) break;
+            int ds = nl + 2;
+            if (ds + (int)cl > (int)body.length()) break;
+            dc.concat(body.c_str() + ds, (unsigned int)cl);
+            pos = ds + (int)cl + 2;
+        }
+        body = dc;
+    }
+    /* Strip BOM */
+    if (body.length() >= 3 &&
+        (uint8_t)body[0] == 0xEF && (uint8_t)body[1] == 0xBB && (uint8_t)body[2] == 0xBF)
+        body = body.substring(3);
+
+    return body;
+}
+
+/* ── Public: fetch all 3 streams, parse, start replay ─────────────────── */
+bool f1sessions_fetchAndReplay()
+{
+    s_replayRequested = false;
+    s_replayFetching  = true;
+    s_lastError       = "";
+
+    Serial.printf("[F1Sess] Fetching session streams: %s  heap=%u\n",
+                  s_replayPath, ESP.getFreeHeap());
+
+    ReplayEvent* events = (ReplayEvent*)malloc(REPLAY_MAX_EVENTS * sizeof(ReplayEvent));
+    if (!events) {
+        s_lastError = "OOM: event array";
+        s_replayFetching = false;
+        return false;
+    }
+    int eventCount = 0;
+
+    static const char* TOPICS[]   = {"TrackStatus", "SessionStatus", "RaceControlMessages"};
+    static const uint8_t TIDS[]   = {0, 1, 2};
+
+    for (int t = 0; t < 3; t++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s%s.jsonStream", s_replayPath, TOPICS[t]);
+        Serial.printf("[F1Sess] GET %s ...\n", TOPICS[t]);
+
+        String body = fetchOneStream(path);
+        if (body.length() == 0) {
+            Serial.printf("[F1Sess] %s: no data / fetch failed\n", TOPICS[t]);
+            continue;
+        }
+        int before = eventCount;
+        eventCount = parseStreamLines(body, TIDS[t], events, REPLAY_MAX_EVENTS, eventCount);
+        Serial.printf("[F1Sess] %s: %d events (body %u bytes)\n",
+                      TOPICS[t], eventCount - before, body.length());
+    }
+
+    s_replayFetching = false;
+
+    if (eventCount == 0) {
+        free(events);
+        s_lastError = "No events in session streams";
+        Serial.println("[F1Sess] " + s_lastError);
+        return false;
+    }
+
+    /* Hand ownership to the replay engine (it will free on stop) */
+    replay_startFromEvents(events, eventCount, s_replaySpeed);
+    Serial.printf("[F1Sess] Replay started: %d events @ %.0fx\n", eventCount, s_replaySpeed);
+    return true;
+}

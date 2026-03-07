@@ -43,5 +43,23 @@ int   replay_eventCount();
 int   replay_currentIdx();
 float replay_speed();
 
+/* Start replay from a pre-built heap-allocated event array.
+   Takes ownership of the array (freed on stop).  Events are sorted
+   internally; caller does NOT need to pre-sort. */
+void replay_startFromEvents(ReplayEvent* events, int count, float speed);
+
+/* Information about the most recently dispatched replay event. */
+struct ReplayLastEvent {
+    bool     valid;       /* false if no event dispatched yet       */
+    uint32_t ts_ms;       /* event timestamp (ms from session start)*/
+    uint8_t  topic;       /* 0=Track 1=Session 2=RaceControl        */
+    char     data[20];    /* raw data string                        */
+    uint32_t simMs;       /* current simulated time (ms)            */
+    uint32_t totalMs;     /* total session duration (ms)            */
+};
+
+/* Snapshot of the last dispatched event (safe to call from any context). */
+ReplayLastEvent replay_lastEvent();
+
 /* Call this from loop() every iteration. Non-blocking. */
 void replay_tick();

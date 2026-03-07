@@ -44,3 +44,20 @@ const String& f1sessions_lastError();
 
 /* Reset the retry counter (allows re-triggering after failures). */
 void f1sessions_resetRetries();
+
+/* ── Session replay: fetch .jsonStream files & drive the replay engine ── */
+
+/* Request fetching a past session's streams for replay.
+   Sets a flag picked up by the f1net task.  Safe to call from
+   the web-server callback. */
+void f1sessions_requestReplay(const char* sessionPath, float speed);
+
+/* true if a replay fetch has been requested but not yet started. */
+bool f1sessions_replayRequested();
+
+/* true while the f1net task is downloading session streams for replay. */
+bool f1sessions_isReplayFetching();
+
+/* Fetch the 3 .jsonStream files, parse events, and start the replay
+   engine.  BLOCKING – call from the f1net task only. */
+bool f1sessions_fetchAndReplay();
