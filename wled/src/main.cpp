@@ -38,10 +38,14 @@ static uint8_t g_forcedSt = 0xFF;
 static volatile F1NetState g_pendingState = F1ST_IDLE;
 static volatile bool       g_pendingValid = false;
 
-static void onF1StateChange(F1NetState newState) {
-    if (replay_isActive() || replay_isLoading()) return;  /* replay has the floor */
+static void applyState(F1NetState newState) {
     g_pendingState = newState;
     g_pendingValid = true;
+}
+
+static void onF1StateChange(F1NetState newState) {
+    if (replay_isActive() || replay_isLoading()) return;  /* replay has the floor */
+    applyState(newState);
 }
 
 /* ── Pending flash event (written by f1net task, consumed in loop()) ─────── */
@@ -108,7 +112,7 @@ static bool connectSTA() {
         delay(500);
         WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK); /* force WPA2 – avoids WPA3 4-way handshake timeout */
         WiFi.begin(g_cfg.ssid, g_cfg.pass);
-        WiFi.setTxPower(WIFI_POWER_8_5dBm); /* workaround: C3 SuperMini broken antenna */
+        WiFi.setTxPower(WIFI_POWER_5dBm); /* workaround: C3 SuperMini broken antenna */
 
         uint32_t t0 = millis();
         while (WiFi.status() != WL_CONNECTED) {
@@ -154,7 +158,7 @@ void setup() {
     Serial.begin(115200);
     /* 3-second delay so USB Serial/JTAG has time to re-enumerate after reset */
     delay(3000);
-    LOG("\n[F1Lamp] Booting…\n");
+    LOG("\n[F1Lamp] Booting...\n");
 
     /* 0. Stop firmware from writing WiFi credentials to NVS (we use LittleFS) */
     WiFi.persistent(false);
@@ -167,6 +171,7 @@ void setup() {
     /* AP+STA mode – connect STA first so AP inherits the same channel */
     WiFi.mode(WIFI_AP_STA);
     delay(100);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm ); /* C3 SuperMini broken antenna – set early so AP beacon is also low-power */
 
     /* 2. Initialise LED strip with saved settings */
     ledfx_init(g_cfg.led_count, g_cfg.f_count, g_cfg.brightness);
@@ -248,7 +253,7 @@ void setup() {
     if (sta) {
         f1net_setCallback(onF1StateChange);
         f1net_setEventCallback(onF1Event);
-        replay_setCallbacks(onF1StateChange, onF1Event);
+        replay_setCallbacks(applyState, onF1Event);
         f1net_setup();
         xTaskCreate(
             [](void*) {
@@ -330,7 +335,7 @@ void loop() {
             WiFi.disconnect(false);
             WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
             WiFi.begin(g_cfg.ssid, g_cfg.pass);
-            WiFi.setTxPower(WIFI_POWER_8_5dBm);
+            WiFi.setTxPower(WIFI_POWER_5dBm);
         }
     }
 

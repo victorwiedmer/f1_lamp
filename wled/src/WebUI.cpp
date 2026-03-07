@@ -183,16 +183,6 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
 <!-- session replay -->
 <div class="card">
   <div style="font-weight:700;font-size:.85rem;margin-bottom:10px">&#127909; Session Replay</div>
-  <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">
-    <select id="rpYear" style="background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:4px 8px">
-      <option value="2026">2026</option>
-      <option value="2025">2025</option>
-    </select>
-    <button class="btn btn-sm" style="background:#1a3a1a;color:#6f6;border:1px solid #375" onclick="loadReplaySessions()">&#128196; Load Sessions</button>
-  </div>
-  <select id="rpSessions" style="width:100%;background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:4px 8px;margin-bottom:8px">
-    <option value="">— click Load Sessions first —</option>
-  </select>
   <div class="row" style="gap:6px;margin-bottom:8px">
     <label style="font-size:.75rem;color:#888">Speed:</label>
     <select id="rpSpeed" style="background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:3px 8px">
@@ -205,7 +195,7 @@ hr{border:none;border-top:1px solid #2a2a2a;margin:8px 0}
     <button class="btn btn-sm" style="background:#1a3a1a;color:#6f6;border:1px solid #375" onclick="startReplay()">&#9654; Start</button>
     <button class="btn btn-sm" style="background:#3a1a1a;color:#f66;border:1px solid #733" onclick="stopReplay()">&#9632; Stop</button>
   </div>
-  <div id="rpStatus" style="font-size:.72rem;color:#888;min-height:1.2em">No session loaded.</div>
+  <div id="rpStatus" style="font-size:.72rem;color:#888;min-height:1.2em">Plays a built-in demo race from flash.</div>
 </div>
 
 <!-- save / reboot -->
@@ -234,8 +224,8 @@ async function fetchStatus(){
     sb.textContent=SN[idx]||'Unknown';
     sb.style.background=b; sb.style.color=f;
     document.getElementById('wifiInfo').textContent=d.ssid||(d.ap?'AP: F1-Lamp':'—');
-    document.getElementById('f1Ok').textContent=d.f1ok?'✓ Connected':'✗ Offline';
-    document.getElementById('f1Ok').style.color=d.f1ok?'#00d2be':'#888';
+    document.getElementById('f1Ok').textContent=d.f1ok?'✓ Connected':'⏳ Waiting for session';
+    document.getElementById('f1Ok').style.color=d.f1ok?'#00d2be':'#aaa';
     const nb=document.getElementById('netBadge');
     nb.textContent=d.ap?'AP Mode':('✓ '+d.ssid);
     nb.style.background=d.ap?'#7a4000':'#003a35';
@@ -365,29 +355,19 @@ async function testEvent(ev){
 
 /* ── Session Replay ── */
 let _rpPoll=null;
-async function loadReplaySessions(){
-  const yr=document.getElementById('rpYear').value;
-  document.getElementById('rpStatus').textContent='Loading sessions\u2026';
-  try{
-    const arr=await(await fetch('/api/replay/sessions?year='+yr)).json();
-    const sel=document.getElementById('rpSessions');
-    if(!arr.length){sel.innerHTML='<option>No sessions found</option>';return;}
-    sel.innerHTML=arr.map(s=>`<option value="${s.p}">${s.l}</option>`).join('');
-    document.getElementById('rpStatus').textContent=arr.length+' sessions loaded.';
-  }catch(e){document.getElementById('rpStatus').textContent='Error: '+e;}
-}
+
 async function startReplay(){
-  const path=document.getElementById('rpSessions').value;
   const speed=parseFloat(document.getElementById('rpSpeed').value);
-  if(!path){document.getElementById('rpStatus').textContent='Pick a session first.';return;}
-  await fetch('/api/replay/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,speed})});
-  document.getElementById('rpStatus').textContent='Fetching streams\u2026';
+  document.getElementById('rpStatus').textContent='Starting replay\u2026';
+  try{
+    await fetch('/api/replay/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed})});
+  }catch(e){document.getElementById('rpStatus').textContent='Error: '+e.message;return;}
   if(_rpPoll)clearInterval(_rpPoll);
   _rpPoll=setInterval(async()=>{
     try{
       const d=await(await fetch('/api/replay/status')).json();
       if(d.loading){
-        document.getElementById('rpStatus').textContent='Fetching streams\u2026';
+        document.getElementById('rpStatus').textContent='Loading\u2026';
       }else if(d.active){
         const pct=d.total>0?Math.round(d.idx*100/d.total):0;
         document.getElementById('rpStatus').textContent=`Playing \u25b6 ${d.idx}/${d.total} events  ${pct}%  (${d.speed}\u00d7)`;
@@ -652,21 +632,12 @@ void webui_init(
         sendJson(req, out);
     });
 
-    /* ── GET /api/replay/sessions?year=N ───────────────────────────────── */
-    s_server.on("/api/replay/sessions", HTTP_GET, [](AsyncWebServerRequest* req) {
-        int year = 2026;
-        if (req->hasParam("year")) year = req->getParam("year")->value().toInt();
-        const char* json = replay_fetchSessionsJson(year);
-        sendJson(req, json ? json : "[]");
-    });
-
-    /* ── POST /api/replay/start  body: {"path":"...","speed":10} ────────── */
+    /* ── POST /api/replay/start  body: {"speed":10}  ─ load & play ── */
     auto rpStartHandler = new AsyncCallbackJsonWebHandler("/api/replay/start",
         [](AsyncWebServerRequest* req, JsonVariant& json) {
             JsonObject obj = json.as<JsonObject>();
-            const char* path = obj["path"] | "";
             float speed = obj["speed"] | 5.0f;
-            if (path[0]) replay_start(path, speed);
+            replay_start(speed);
             sendOk(req);
         });
     s_server.addHandler(rpStartHandler);
