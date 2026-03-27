@@ -1,14 +1,18 @@
-# Build output files
+# Build output / capture files
 *.txt
 *.log
-out.txt
-stderr.txt
-flash_out.txt
-build_errors.txt
+*.der
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# PlatformIO
+.pio/
 
 # VS Code
 .vscode/settings.json
