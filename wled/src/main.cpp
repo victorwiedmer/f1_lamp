@@ -170,6 +170,66 @@ void setup() {
     /* 1. Load config from LittleFS */
     cfg_init();
 
+    /* ── EARLY DEEP-SLEEP CHECK ─────────────────────────────────────────
+     *  When deep_sleep is enabled, do a MINIMAL boot: STA-only WiFi (no AP,
+     *  no scan, no LEDs, no web server) just to get NTP time and check the
+     *  built-in calendar.  If it's not race weekend → sleep immediately.
+     *  This cuts wake time from ~30-60 s to ~5-8 s, saving massive battery.
+     * ─────────────────────────────────────────────────────────────────── */
+    if (g_cfg.deep_sleep && g_cfg.ssid[0] != '\0') {
+        Serial.println("[Sleep] Deep-sleep mode – quick time check...");
+        WiFi.mode(WIFI_STA);
+        delay(50);
+        WiFi.setTxPower(WIFI_POWER_8_5dBm);
+        WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
+        WiFi.begin(g_cfg.ssid, g_cfg.pass);
+
+        /* Single quick connect – 10 s max */
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+            delay(50);
+        }
+
+        bool quickSta = (WiFi.status() == WL_CONNECTED);
+        if (quickSta) {
+            Serial.printf("[Sleep] WiFi OK – IP %s\n", WiFi.localIP().toString().c_str());
+            /* Quick NTP sync */
+            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+            uint32_t ntpT0 = millis();
+            while (time(nullptr) < 1577836800UL && millis() - ntpT0 < 8000) {
+                delay(50);
+            }
+        }
+
+        bool haveTime = (time(nullptr) > 1577836800UL);
+        if (haveTime) {
+            Serial.printf("[Sleep] Time: %lu\n", (unsigned long)time(nullptr));
+            f1cal_update();   /* refresh built-in calendar with current time */
+
+            if (!f1cal_weekendActive()) {
+                /* NOT race weekend → go back to sleep */
+                uint32_t secs = f1cal_sleepSeconds();
+                Serial.printf("[Sleep] Not race weekend – sleeping %us (%.1f h)\n",
+                              secs, secs / 3600.0f);
+                WiFi.disconnect(true);
+                WiFi.mode(WIFI_OFF);
+                delay(50);
+                esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+                esp_deep_sleep_start();   /* never returns */
+            }
+            Serial.println("[Sleep] Race weekend active – full boot");
+        } else {
+            Serial.println("[Sleep] No time available – full boot to stay safe");
+        }
+
+        /* Disconnect STA before switching to AP_STA mode for full boot */
+        WiFi.disconnect(false);
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+    }
+
+    /* ── FULL BOOT PATH ─────────────────────────────────────────────── */
+
     /* AP+STA mode – connect STA first so AP inherits the same channel */
     WiFi.mode(WIFI_AP_STA);
     delay(100);
@@ -314,30 +374,47 @@ void setup() {
         LOG("  mDNS: http://f1lamp.local\n");
     }
 
-    /* ── Deep sleep: if enabled and outside a race weekend, hibernate ───── */
+    /* ── Deep sleep check already done at top of setup() ────────────────
+     *  If we reach here with deep_sleep enabled, it means race weekend is
+     *  active → stay fully awake.  We'll re-check in loop() after the
+     *  weekend ends to go back to sleep.                                    */
     if (g_cfg.deep_sleep) {
-        bool awake = f1cal_weekendActive();
-        if (!awake) {
-            uint32_t secs = f1cal_sleepSeconds();
-            Serial.printf("[Sleep] Deep sleep for %us (%.1f min)\n",
-                          secs, secs / 60.0f);
-            /* 1-second white pulse so you can see it's alive before sleeping */
-            ledfx_setEffect(0, 12, 12, 12, g_cfg.brightness);
-            ledfx_tick();
-            delay(1000);
-            ledfx_allOff();
-            delay(50);
-            esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
-            esp_deep_sleep_start();   /* never returns */
-        }
-        Serial.println("[Sleep] Race weekend active – staying awake");
+        Serial.println("[Sleep] Race weekend active – full boot complete, staying awake");
     }
+
+    /* ── Enable WiFi modem sleep for power savings while connected ────
+     *  The radio sleeps between AP DTIM beacons (~100 ms), reducing idle
+     *  WiFi power from ~120 mA to ~20 mA.  Works transparently.           */
+    WiFi.setSleep(true);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
 /*  loop                                                                      */
 /* ══════════════════════════════════════════════════════════════════════════ */
 void loop() {
+    /* ── Deep-sleep re-check: after race weekend ends, go back to sleep ── */
+    if (g_cfg.deep_sleep) {
+        static uint32_t s_sleepCheckMs = 0;
+        if (millis() - s_sleepCheckMs > 60000) {   /* check every 60 s */
+            s_sleepCheckMs = millis();
+            if (time(nullptr) > 1577836800UL) {
+                f1cal_update();
+                if (!f1cal_weekendActive()) {
+                    uint32_t secs = f1cal_sleepSeconds();
+                    Serial.printf("[Sleep] Race weekend ended – sleeping %us (%.1f h)\n",
+                                  secs, secs / 3600.0f);
+                    ledfx_allOff();
+                    delay(100);
+                    WiFi.disconnect(true);
+                    WiFi.mode(WIFI_OFF);
+                    delay(50);
+                    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+                    esp_deep_sleep_start();   /* never returns */
+                }
+            }
+        }
+    }
+
     /* ── WiFi watchdog: reconnect every 30 s if STA drops ───────────── */
     static uint32_t wifiRetryMs = 0;
     if (!g_apMode && WiFi.status() != WL_CONNECTED) {
