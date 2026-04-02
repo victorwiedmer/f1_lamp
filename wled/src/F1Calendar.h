@@ -1,7 +1,8 @@
 #pragma once
 /*
- * F1Calendar.h  –  Fetches the F1 race calendar and computes a
- *                  race-week idle-brightness ramp.
+ * F1Calendar.h  –  Fetches the F1 race calendar from the Jolpica API
+ *                  (Ergast-compatible) and computes a race-week
+ *                  idle-brightness ramp.
  *
  * Source : Jolpica API (Ergast-compatible) at api.jolpi.ca
  *
@@ -14,10 +15,9 @@
 #include <Arduino.h>
 
 /*
- * Fetch the 2026 race calendar from the Jolpica API.
- * Must be called after WiFi STA is connected and NTP has synced.
- * Non-blocking within a task; call from setup() after WiFi connects,
- * or schedule a periodic refresh (once per day is enough).
+ * Scan the available calendar data (API-fetched, custom LittleFS, or
+ * built-in) and find the next upcoming race.  Updates the ramp state.
+ * Non-blocking; call from setup() after WiFi/NTP or periodically.
  * Returns true if a future race was found.
  */
 bool f1cal_update();
@@ -58,3 +58,31 @@ int f1cal_daysUntilRace();
  */
 bool     f1cal_weekendActive();
 uint32_t f1cal_sleepSeconds();
+
+/*
+ * Custom calendar management (Phase 4 – dynamic calendar from LittleFS).
+ * hasCustomCalendar – true if /calendar_custom.json exists on LittleFS.
+ * deleteCustomCalendar – removes the custom calendar; returns true if deleted.
+ */
+bool f1cal_hasCustomCalendar();
+bool f1cal_deleteCustomCalendar();
+
+/*
+ * Jolpica API fetch – fetches the current season calendar over HTTPS.
+ * Must be called from the f1net FreeRTOS task (blocking TLS connection).
+ *
+ * requestApiFetch()      – set a flag to request a fetch (non-blocking)
+ * apiFetchRequested()    – check if a fetch has been requested
+ * isApiFetching()        – true while the fetch is in progress
+ * apiFetched()           – true if a fetch has succeeded at least once
+ * fetchApi()             – actual blocking fetch (call from f1net task)
+ * nextRaceJson()         – cached JSON string for /api/nextrace
+ * apiError()             – last error message from API fetch
+ */
+void          f1cal_requestApiFetch();
+bool          f1cal_apiFetchRequested();
+bool          f1cal_isApiFetching();
+bool          f1cal_apiFetched();
+bool          f1cal_fetchApi();
+const String& f1cal_nextRaceJson();
+const String& f1cal_apiError();

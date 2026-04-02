@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – Settings</title>
+<link rel="stylesheet" href="/common.css">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<!-- WiFi shortcut -->
+<div class="card">
+  <h2>WiFi</h2>
+  <div class="info-row"><span>SSID</span><span id="curSsid">—</span></div>
+  <div class="info-row"><span>IP</span><span id="curIp" style="font-family:monospace">—</span></div>
+  <div style="margin-top:8px"><a href="/wifi.html" class="btn btn-sm btn-outline">Configure WiFi</a></div>
+</div>
+
+<!-- event delay -->
+<div class="card">
+  <h2>Event Delay</h2>
+  <div class="row">
+    <input type="range" min="0" max="120" id="delaySlider" oninput="onDelay(this.value)" style="flex:1">
+    <span id="delayVal" style="font-size:.85rem;color:#888;width:38px;text-align:right">40s</span>
+  </div>
+  <small style="color:#555">Delay (in seconds) before F1 events update LEDs. Default: 40s.</small>
+</div>
+
+<!-- LED hardware -->
+<div class="card">
+  <h2>LED Hardware</h2>
+  <div class="row">
+    <label style="margin:0">LED Count</label>
+    <input type="text" id="ledCount" style="width:60px;text-align:center" value="22">
+  </div>
+  <div class="row" style="margin-top:4px">
+    <label style="margin:0">F Segment LEDs</label>
+    <input type="text" id="fCount" style="width:60px;text-align:center" value="17">
+  </div>
+  <small>Total LEDs and how many form the "F" letter segment.</small>
+</div>
+
+<!-- calendar -->
+<div class="card">
+  <h2>Race Calendar</h2>
+  <div class="info-row"><span>Next Race</span><span id="nextRace">—</span></div>
+  <div class="info-row"><span>Source</span><span id="calSource">Built-in 2026</span></div>
+  <hr>
+  <div style="font-size:.72rem;color:#555;margin-bottom:6px">Upload a calendar JSON to override the built-in schedule:</div>
+  <div class="row">
+    <input type="file" id="calFile" accept=".json" style="font-size:.75rem;color:#888">
+    <button class="btn btn-sm btn-save" onclick="uploadCalendar()">Upload</button>
+    <span class="ok" id="calOk">Uploaded!</span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <button class="btn btn-sm btn-outline" onclick="deleteCalendar()">Reset to Built-in</button>
+    <span class="ok" id="calDelOk">Reset!</span>
+  </div>
+  <small>Format: <code style="color:#888">{"races":[{"name":"Australian","raceDate":"2026-03-08","raceTime":"04:00:00Z","firstSessDate":"2026-03-06","firstSessTime":"01:30:00Z"},...]}</code></small>
+</div>
+
+<!-- firmware update -->
+<div class="card">
+  <h2>Firmware Update</h2>
+  <div style="font-size:.72rem;color:#555;margin-bottom:8px">Upload a compiled .bin to update firmware over WiFi (OTA).</div>
+  <div class="row">
+    <input type="file" id="fwFile" accept=".bin" style="font-size:.75rem;color:#888">
+    <button class="btn btn-sm btn-save" onclick="uploadFirmware()">Upload</button>
+  </div>
+  <div id="fwProgress" style="display:none;margin-top:6px">
+    <div style="background:#2a2a2a;border-radius:3px;height:6px;overflow:hidden">
+      <div id="fwBar" style="height:100%;background:#00d2be;width:0%;transition:width .3s"></div>
+    </div>
+    <div id="fwStatus" style="font-size:.72rem;color:#888;margin-top:3px">Uploading…</div>
+  </div>
+</div>
+
+<!-- save / reboot -->
+<div class="card">
+  <div class="row">
+    <button class="btn btn-save" onclick="saveAll()">Save Config</button>
+    <span class="ok" id="saveOk">Saved!</span>
+    <button class="btn btn-danger" onclick="doReboot()" style="margin-left:auto">Reboot</button>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+buildHeader();
+buildNav('settings');
+
+let cfgLoaded=false;
+
+async function loadConfig(){
+  try{
+    const cfg=await(await fetch('/api/config')).json();
+    document.getElementById('delaySlider').value=cfg.delay_s||40;
+    document.getElementById('delayVal').textContent=(cfg.delay_s||40)+'s';
+    document.getElementById('ledCount').value=cfg.led_count||22;
+    document.getElementById('fCount').value=cfg.f_count||17;
+    cfgLoaded=true;
+  }catch(e){}
+}
+
+function onDelay(v){document.getElementById('delayVal').textContent=v+'s';}
+
+async function saveAll(){
+  const body={
+    brightness: undefined,  /* don't change – managed from status page */
+    delay_s: +document.getElementById('delaySlider').value||40,
+    led_count: +document.getElementById('ledCount').value||22,
+    f_count: +document.getElementById('fCount').value||17
+  };
+  /* We need to include states to not lose them; fetch current config first */
+  try{
+    const cur=await(await fetch('/api/config')).json();
+    body.brightness=cur.brightness;
+    body.states=cur.states;
+  }catch(e){}
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r.ok) showOk('saveOk');
+}
+
+async function doReboot(){
+  if(!confirm('Reboot the F1 Lamp?'))return;
+  await fetch('/api/reboot',{method:'POST'});
+}
+
+async function uploadCalendar(){
+  const file=document.getElementById('calFile').files[0];
+  if(!file){alert('Select a calendar JSON file first');return;}
+  try{
+    const text=await file.text();
+    JSON.parse(text);  /* validate */
+    const r=await fetch('/api/calendar',{method:'POST',headers:{'Content-Type':'application/json'},body:text});
+    if(r.ok){showOk('calOk');document.getElementById('calSource').textContent='Custom (uploaded)';}
+  }catch(e){alert('Invalid JSON: '+e.message);}
+}
+
+async function deleteCalendar(){
+  const r=await fetch('/api/calendar',{method:'DELETE'});
+  if(r.ok){showOk('calDelOk');document.getElementById('calSource').textContent='Built-in 2026';}
+}
+
+async function uploadFirmware(){
+  const file=document.getElementById('fwFile').files[0];
+  if(!file){alert('Select a .bin firmware file first');return;}
+  const prog=document.getElementById('fwProgress');
+  const bar=document.getElementById('fwBar');
+  const status=document.getElementById('fwStatus');
+  prog.style.display='block';
+  bar.style.width='0%';
+  status.textContent='Uploading…';
+
+  const formData=new FormData();
+  formData.append('firmware',file);
+
+  try{
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','/api/update');
+    xhr.upload.onprogress=(e)=>{
+      if(e.lengthComputable){
+        const pct=Math.round(e.loaded*100/e.total);
+        bar.style.width=pct+'%';
+        status.textContent='Uploading… '+pct+'%';
+      }
+    };
+    xhr.onload=()=>{
+      if(xhr.status===200){
+        bar.style.width='100%';
+        status.textContent='✓ Upload complete — rebooting…';
+        status.style.color='#00d2be';
+      }else{
+        status.textContent='✗ Upload failed: '+xhr.statusText;
+        status.style.color='#e10600';
+      }
+    };
+    xhr.onerror=()=>{status.textContent='✗ Upload failed';status.style.color='#e10600';};
+    xhr.send(formData);
+  }catch(e){status.textContent='✗ Error: '+e.message;status.style.color='#e10600';}
+}
+
+function onStatus(d){
+  document.getElementById('curSsid').textContent=d.ssid||'(none)';
+  document.getElementById('curIp').textContent=d.ip||'—';
+  if(d.nextRace) document.getElementById('nextRace').textContent=d.nextRace;
+}
+
+/* Check if custom calendar exists */
+async function checkCalSource(){
+  try{
+    const r=await fetch('/api/calendar');
+    const d=await r.json();
+    document.getElementById('calSource').textContent=d.custom?'Custom (uploaded)':'Built-in 2026';
+  }catch(e){}
+}
+
+setTimeout(loadConfig,200);
+setTimeout(()=>pollStatus(onStatus),400);
+setTimeout(checkCalSource,600);
+setInterval(()=>pollStatus(onStatus),5000);
+</script>
+</body></html>

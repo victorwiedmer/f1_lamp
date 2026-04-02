@@ -95,6 +95,7 @@ void cfg_load() {
     g_cfg.feat_drs          = doc["feat_drs"]          | false;
     g_cfg.feat_start_lights = doc["feat_start_lights"] | true;
     g_cfg.deep_sleep        = doc["deep_sleep"]        | false;
+    g_cfg.delay_s           = doc["delay_s"]           | 40;
 
     JsonArray arr = doc["states"].as<JsonArray>();
     for (int i = 0; i < CFG_NUM_STATES && i < (int)arr.size(); i++) {
@@ -132,6 +133,7 @@ void cfg_save() {
     doc["feat_drs"]          = g_cfg.feat_drs;
     doc["feat_start_lights"] = g_cfg.feat_start_lights;
     doc["deep_sleep"]        = g_cfg.deep_sleep;
+    doc["delay_s"]           = g_cfg.delay_s;
 
     JsonArray arr = doc["states"].to<JsonArray>();
     for (int i = 0; i < CFG_NUM_STATES; i++) {

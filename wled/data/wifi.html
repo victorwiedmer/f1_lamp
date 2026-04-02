@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – WiFi Setup</title>
+<link rel="stylesheet" href="/common.css">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<div class="card">
+  <h2>WiFi</h2>
+  <div class="row" style="margin-bottom:2px">
+    <label style="margin:0;flex:1">SSID</label>
+    <button class="btn-scan" id="scanBtn" onclick="scanNetworks()">Scan</button>
+  </div>
+  <input type="text" id="wSsid" autocomplete="off" placeholder="Network name">
+  <div class="net-list" id="netList"></div>
+  <label>Password</label>
+  <input type="password" id="wPass" autocomplete="new-password">
+  <small>Leave password blank to keep existing.</small>
+  <div style="margin-top:10px">
+    <button class="btn btn-save" onclick="saveWifi()">Save &amp; Reconnect</button>
+    <span class="ok" id="wOk">Saved — rebooting…</span>
+  </div>
+</div>
+
+<div class="card" id="infoCard" style="display:none">
+  <h2>Network Info</h2>
+  <div class="info-row"><span>SSID</span><span id="curSsid">—</span></div>
+  <div class="info-row"><span>IP</span><span id="curIp" style="font-family:monospace">—</span></div>
+  <div class="info-row"><span>Signal</span><span id="curRssi">—</span></div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+buildHeader();
+buildNav('');  /* no active highlight – wifi is a sub-page */
+
+async function saveWifi(){
+  const body={ssid:document.getElementById('wSsid').value,pass:document.getElementById('wPass').value};
+  const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r.ok) showOk('wOk');
+}
+
+async function scanNetworks(){
+  const btn=document.getElementById('scanBtn');
+  const list=document.getElementById('netList');
+  btn.disabled=true; btn.textContent='Scanning…';
+  list.innerHTML='<span style="font-size:.75rem;color:#555">Scanning…</span>';
+  try{
+    for(let i=0;i<30;i++){
+      const d=await(await fetch('/api/scan')).json();
+      if(d.scanning){await new Promise(r=>setTimeout(r,500));continue;}
+      list.innerHTML='';
+      if(!d.length){list.innerHTML='<span style="font-size:.75rem;color:#555">No networks found</span>';return;}
+      d.forEach(n=>{
+        const rssiColor=n.rssi>-60?'#00d2be':n.rssi>-75?'#ffc800':'#e10600';
+        const el=document.createElement('div');
+        el.className='net-item';
+        el.innerHTML=`<span class="rssi-dot" style="background:${rssiColor}"></span>${escHtml(n.ssid)}<span style="font-size:.7rem;color:#555">${n.rssi}dBm</span>`;
+        el.onclick=()=>{document.getElementById('wSsid').value=n.ssid;document.getElementById('wPass').focus();};
+        list.appendChild(el);
+      });
+      return;
+    }
+    list.innerHTML='<span style="font-size:.75rem;color:#e10600">Scan timed out</span>';
+  }catch(e){list.innerHTML='<span style="font-size:.75rem;color:#e10600">Scan failed</span>';}
+  finally{btn.disabled=false;btn.textContent='Scan';}
+}
+
+function onStatus(d){
+  if(d.ssid) document.getElementById('wSsid').value=d.ssid;
+  const info=document.getElementById('infoCard');
+  if(d.ssid&&!d.ap){
+    info.style.display='block';
+    document.getElementById('curSsid').textContent=d.ssid;
+    document.getElementById('curIp').textContent=d.ip||'—';
+    const rs=d.rssi;
+    const col=rs>-60?'#00d2be':rs>-75?'#ffc800':'#e10600';
+    document.getElementById('curRssi').textContent=rs+' dBm';
+    document.getElementById('curRssi').style.color=col;
+  }else{info.style.display='none';}
+}
+
+setTimeout(()=>pollStatus(onStatus),300);
+setInterval(()=>pollStatus(onStatus),5000);
+</script>
+</body></html>

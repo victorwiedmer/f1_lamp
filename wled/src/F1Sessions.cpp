@@ -28,6 +28,11 @@
 /* lwIP for raw sockets */
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include <lwip/inet.h>
+
+/* FreeRTOS for vTaskDelay */
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 /* ── Config ───────────────────────────────────────────────────────────── */
 static constexpr const char* HOST = "livetiming.formula1.com";
@@ -147,7 +152,7 @@ static bool tls_connect(TlsConn& c, const char* host, const char* port)
         return false;
     }
 
-    /* TCP connect */
+    /* TCP connect with retry */
     Serial.printf("[F1Sess] DNS resolve + TCP connect to %s:%s ...\n", host, port);
     struct addrinfo hints = {}, *res = nullptr;
     hints.ai_family = AF_INET;
@@ -159,25 +164,43 @@ static bool tls_connect(TlsConn& c, const char* host, const char* port)
         return false;
     }
 
-    c.sock = lwip_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (c.sock < 0) {
-        s_lastError = "socket() failed: errno=" + String(errno);
-        lwip_freeaddrinfo(res);
-        tls_cleanup(c);
-        return false;
+    /* Log resolved IP for diagnostics */
+    {
+        struct sockaddr_in* sa = (struct sockaddr_in*)res->ai_addr;
+        Serial.printf("[F1Sess] Resolved %s -> %s\n", host,
+                      inet_ntoa(sa->sin_addr));
     }
 
-    /* Set socket timeout */
-    struct timeval tv;
-    tv.tv_sec = TIMEOUT_MS / 1000;
-    tv.tv_usec = (TIMEOUT_MS % 1000) * 1000;
-    lwip_setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    lwip_setsockopt(c.sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    bool tcpOk = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            Serial.printf("[F1Sess] TCP retry %d/3 after 3s...\n", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
 
-    ret = lwip_connect(c.sock, res->ai_addr, res->ai_addrlen);
+        c.sock = lwip_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (c.sock < 0) {
+            s_lastError = "socket() failed: errno=" + String(errno);
+            continue;
+        }
+
+        /* Set socket timeout */
+        struct timeval tv;
+        tv.tv_sec = TIMEOUT_MS / 1000;
+        tv.tv_usec = (TIMEOUT_MS % 1000) * 1000;
+        lwip_setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        lwip_setsockopt(c.sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        ret = lwip_connect(c.sock, res->ai_addr, res->ai_addrlen);
+        if (ret == 0) { tcpOk = true; break; }
+
+        Serial.printf("[F1Sess] TCP connect errno=%d\n", errno);
+        lwip_close(c.sock);
+        c.sock = -1;
+    }
     lwip_freeaddrinfo(res);
-    if (ret != 0) {
-        s_lastError = "TCP connect failed: errno=" + String(errno);
+    if (!tcpOk) {
+        s_lastError = "TCP connect failed after 3 tries: errno=" + String(errno);
         tls_cleanup(c);
         return false;
     }
@@ -410,6 +433,76 @@ bool f1sessions_fetch(int year)
     Serial.printf("[F1Sess] Cached %u bytes, %d meetings\n",
                   s_json.length(), meetings.size());
     return true;
+}
+
+/* ── Generic HTTPS GET helper (reusable by other modules) ─────────── */
+
+String f1sessions_httpsGet(const char* path, String& outError,
+                          const char* host, const char* port)
+{
+    const char* h = host ? host : HOST;
+    const char* p = port ? port : PORT_STR;
+
+    TlsConn* cp = new (std::nothrow) TlsConn;
+    if (!cp) { outError = "OOM: TlsConn"; return String(); }
+
+    if (!tls_connect(*cp, h, p)) {
+        outError = s_lastError;
+        delete cp;
+        return String();
+    }
+
+    String req = String("GET ") + path + " HTTP/1.1\r\n"
+               + "Host: " + h + "\r\n"
+               + "Accept: application/json\r\n"
+               + "Connection: close\r\n\r\n";
+
+    if (!tls_write_all(*cp, req.c_str(), req.length())) {
+        outError = "Write failed";
+        tls_cleanup(*cp); delete cp;
+        return String();
+    }
+
+    String raw = tls_read_all(*cp);
+    tls_cleanup(*cp);
+    delete cp;
+
+    if (raw.length() == 0) { outError = "Empty response"; return String(); }
+
+    int sep = raw.indexOf("\r\n\r\n");
+    if (sep < 0) { outError = "No header separator"; return String(); }
+    String headers = raw.substring(0, sep);
+    String body = raw.substring(sep + 4);
+    raw = String();
+
+    if (headers.indexOf("200") < 0) {
+        outError = "HTTP: " + headers.substring(0, 60);
+        return String();
+    }
+
+    /* Dechunk if needed */
+    if (headers.indexOf("chunked") >= 0) {
+        String dc; dc.reserve(body.length());
+        int pos = 0;
+        while (pos < (int)body.length()) {
+            int nl = body.indexOf("\r\n", pos);
+            if (nl < 0) break;
+            unsigned long cl = strtoul(body.c_str() + pos, nullptr, 16);
+            if (cl == 0) break;
+            int ds = nl + 2;
+            if (ds + (int)cl > (int)body.length()) break;
+            dc.concat(body.c_str() + ds, (unsigned int)cl);
+            pos = ds + (int)cl + 2;
+        }
+        body = dc;
+    }
+
+    /* Strip UTF-8 BOM */
+    if (body.length() >= 3 &&
+        (uint8_t)body[0] == 0xEF && (uint8_t)body[1] == 0xBB && (uint8_t)body[2] == 0xBF)
+        body = body.substring(3);
+
+    return body;
 }
 
 bool f1sessions_hasData()       { return s_hasData;  }

@@ -67,11 +67,23 @@
 #undef  MBEDTLS_ECP_NIST_OPTIM
 #define MBEDTLS_ECP_NIST_OPTIM
 
+/* ECDSA signatures (needed for ECDHE-ECDSA cipher suites, e.g. Cloudflare/GitHub) */
+#undef  MBEDTLS_ECDSA_C
+#define MBEDTLS_ECDSA_C
+
+/* ASN1 write (ECDSA signature encoding – already in SDK lib, just ensure macro) */
+#undef  MBEDTLS_ASN1_WRITE_C
+#define MBEDTLS_ASN1_WRITE_C
+
 /* ---- Key-exchange algorithms ---- */
 
-/* ECDHE-RSA: server cert=RSA, ephemeral ECDH key-exchange (most common) */
+/* ECDHE-RSA: server cert=RSA, ephemeral ECDH key-exchange */
 #undef  MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+
+/* ECDHE-ECDSA: server cert=ECDSA, ephemeral ECDH (Cloudflare, GitHub, etc.) */
+#undef  MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 
 /* Plain RSA key exchange as fallback */
 #undef  MBEDTLS_KEY_EXCHANGE_RSA_ENABLED

@@ -46,6 +46,9 @@ struct AppConfig {
     bool     deep_sleep;         /* enter deep sleep between sessions              */
 
     StateEffect states[CFG_NUM_STATES];
+
+    // --- F1 event delay (seconds) ---
+    uint16_t delay_s = 40; // default 40s
 };
 
 extern AppConfig g_cfg;

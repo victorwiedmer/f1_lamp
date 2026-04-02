@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – Effects</title>
+<link rel="stylesheet" href="/common.css">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<div class="card">
+  <h2>Effects by State</h2>
+  <div style="font-size:.68rem;color:#555;margin-bottom:6px">State › Effect › Color › Speed</div>
+  <div id="effectsGrid"></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button class="btn btn-save" onclick="saveEffects()">Save Effects</button>
+    <span class="ok" id="saveOk">Saved!</span>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+buildHeader();
+buildNav('effects');
+
+let cfg=null;
+
+async function loadConfig(){
+  try{
+    cfg=await(await fetch('/api/config')).json();
+    buildEffects();
+  }catch(e){console.error(e);}
+}
+
+function buildEffects(){
+  if(!cfg)return;
+  const g=document.getElementById('effectsGrid');
+  g.innerHTML='';
+  cfg.states.forEach((s,i)=>{
+    if(i>=SN.length)return;
+    const isAlt=s.effect===4;
+    const row=document.createElement('div');
+    row.className='eff-row';
+    row.innerHTML=
+      `<div class="eff-label" style="background:${SB[i]};color:${SF[i]}">${SN[i]}</div>`+
+      `<select id="ee${i}" onchange="onEffChange(${i})">${EF.map((n,j)=>`<option value="${j}"${j==s.effect?' selected':''}>${n}</option>`).join('')}</select>`+
+      `<div style="display:flex;gap:3px;align-items:center">`+
+        `<input type="color" id="ec${i}" value="${rgb2hex(s.r,s.g,s.b)}" title="Color A">`+
+        `<input type="color" id="ec2_${i}" value="${rgb2hex(s.r2,s.g2,s.b2)}" title="Color B (Alt Letters)" style="display:${isAlt?'inline-block':'none'}">`+
+      `</div>`+
+      `<div class="spd-wrap"><input type="range" min="1" max="255" id="es${i}" value="${s.speed}" oninput="document.getElementById('ev${i}').textContent=this.value"><span id="ev${i}">${s.speed}</span></div>`;
+    g.appendChild(row);
+  });
+}
+
+function onEffChange(i){
+  const isAlt=+document.getElementById('ee'+i).value===4;
+  document.getElementById('ec2_'+i).style.display=isAlt?'inline-block':'none';
+}
+
+function collectCfg(){
+  const n=cfg?cfg.states.length:SN.length;
+  const states=Array.from({length:n},(_,i)=>{
+    const [r,gb,b]=hex2rgb(document.getElementById('ec'+i)?.value||'#000000');
+    const [r2,g2,b2]=hex2rgb(document.getElementById('ec2_'+i)?.value||'#000000');
+    return{
+      effect:+document.getElementById('ee'+i).value,
+      r, g:gb, b,
+      speed:+document.getElementById('es'+i).value,
+      r2, g2, b2,
+      revert_s: cfg?cfg.states[i].revert_s:0
+    };
+  });
+  return{
+    brightness: cfg?cfg.brightness:128,
+    delay_s: cfg?cfg.delay_s:40,
+    states
+  };
+}
+
+async function saveEffects(){
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectCfg())});
+  if(r.ok) showOk('saveOk');
+}
+
+setTimeout(loadConfig,300);
+pollStatus();
+setInterval(()=>pollStatus(),5000);
+</script>
+</body></html>

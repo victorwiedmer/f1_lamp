@@ -62,6 +62,31 @@ F1NetState f1net_getState(void);
 /* Disconnect and reset (called when usermod is disabled) */
 void f1net_disconnect(void);
 
+/* ── Live event log (ring buffer of recent session events) ──────────── */
+#define F1_EVENT_LOG_MAX  40
+#define F1_EVENT_MSG_LEN  96
+
+typedef struct {
+    uint32_t epoch;                   /* UTC epoch seconds              */
+    char     category[20];            /* "Track", "Session", "RaceCtrl" */
+    char     message[F1_EVENT_MSG_LEN]; /* Human-readable event text     */
+} F1LiveEvent;
+
+/* Get current event count (may be < F1_EVENT_LOG_MAX) */
+int  f1net_eventCount(void);
+
+/* Get event at index (0 = oldest). Returns false if out of range. */
+bool f1net_getEvent(int idx, F1LiveEvent* out);
+
+/* True while a session is active (between Started and Finished/Inactive) */
+bool f1net_sessionActive(void);
+
+/* Epoch time when current session ended (0 if still active or no session) */
+uint32_t f1net_sessionEndEpoch(void);
+
+/* Clear the event log manually */
+void f1net_clearEvents(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

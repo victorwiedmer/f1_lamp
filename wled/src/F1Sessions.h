@@ -42,6 +42,15 @@ void f1sessions_clear();
 /* Last error message from a failed fetch (for diagnostics). */
 const String& f1sessions_lastError();
 
+/* Generic HTTPS GET.  When host/port are nullptr, defaults to
+   livetiming.formula1.com:443.
+   Returns decoded response body on success, empty String on failure.
+   `outError` is set to a diagnostic string on failure.
+   BLOCKING – call from f1net task only. */
+String f1sessions_httpsGet(const char* path, String& outError,
+                          const char* host = nullptr,
+                          const char* port = nullptr);
+
 /* Reset the retry counter (allows re-triggering after failures). */
 void f1sessions_resetRetries();
 

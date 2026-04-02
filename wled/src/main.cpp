@@ -37,10 +37,12 @@ static uint8_t g_forcedSt = 0xFF;
 /* ── F1 state change callback (called from F1NetWork task) ──────────────── */
 static volatile F1NetState g_pendingState = F1ST_IDLE;
 static volatile bool       g_pendingValid = false;
+static volatile uint32_t   g_pendingStateMs = 0; // millis() when event was received
 
 static void applyState(F1NetState newState) {
     g_pendingState = newState;
     g_pendingValid = true;
+    g_pendingStateMs = millis();
 }
 
 static void onF1StateChange(F1NetState newState) {
@@ -291,6 +293,8 @@ void setup() {
         if (time(nullptr) > 1577836800UL) {
             Serial.printf("[NTP] Synced: %lu\n", (unsigned long)time(nullptr));
             f1cal_update();
+            /* Request API fetch for full session schedule (runs in f1net task) */
+            f1cal_requestApiFetch();
         } else {
             Serial.println("[NTP] Sync timed out");
         }
@@ -354,16 +358,20 @@ void loop() {
         return;
     }
 
-    /* ── Apply any pending F1 state change (feature-aware dispatch) ───── */
+    /* ── Apply any pending F1 state change (feature-aware dispatch, with delay) ───── */
     if (g_pendingValid && g_forcedSt == 0xFF) {
-        g_pendingValid = false;
-        F1NetState st = (F1NetState)g_pendingState;
-        if (st == F1ST_SESSION_START && g_cfg.feat_start_lights && g_slPhase == 0) {
-            startLightsBegin();             /* start lights countdown        */
-        } else if (st == F1ST_CHEQUERED && g_cfg.feat_winner) {
-            ledfx_setEffect(5, 0, 0, 0, 200); /* effect 5 = rainbow_spin    */
-        } else {
-            ledfx_applyState(st);
+        uint32_t now = millis();
+        uint32_t delayMs = (uint32_t)g_cfg.delay_s * 1000UL;
+        if (now - g_pendingStateMs >= delayMs) {
+            g_pendingValid = false;
+            F1NetState st = (F1NetState)g_pendingState;
+            if (st == F1ST_SESSION_START && g_cfg.feat_start_lights && g_slPhase == 0) {
+                startLightsBegin();             /* start lights countdown        */
+            } else if (st == F1ST_CHEQUERED && g_cfg.feat_winner) {
+                ledfx_setEffect(5, 0, 0, 0, 200); /* effect 5 = rainbow_spin    */
+            } else {
+                ledfx_applyState(st);
+            }
         }
     } else {
         g_pendingValid = false;

@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <Arduino.h>        /* millis(), Serial                        */
 
 /* ESP-IDF TLS */
@@ -33,6 +34,7 @@ extern "C" {
 
 #include "F1NetWork.h"
 #include "F1Sessions.h"
+#include "F1Calendar.h"
 
 /* For select() / fd_set on ESP-IDF */
 #include <sys/select.h>
@@ -81,11 +83,36 @@ static bool        s_sessionActive = false;
 static int         s_connFails    = 2;   /* start disabled – esp_tls has TLS compiled out, crashes on connect */
 static constexpr int MAX_CONN_FAILS = 2; /* stop retrying after this many    */
 
+/* ── Live event ring buffer ──────────────────────────────────────────── */
+static F1LiveEvent s_eventLog[F1_EVENT_LOG_MAX];
+static int         s_evHead    = 0;   /* next write position              */
+static int         s_evCount   = 0;   /* total events stored              */
+static uint32_t    s_sessEndEpoch = 0; /* epoch when session ended (0=active) */
+
+static void logEvent(const char* category, const char* message) {
+    /* Auto-clear if >1h past session end */
+    if (s_sessEndEpoch > 0) {
+        time_t now = time(nullptr);
+        if (now > (time_t)s_sessEndEpoch + 3600) {
+            s_evCount = 0;
+            s_evHead  = 0;
+            s_sessEndEpoch = 0;
+            return;  /* discard stale events */
+        }
+    }
+    F1LiveEvent& e = s_eventLog[s_evHead];
+    e.epoch = (uint32_t)time(nullptr);
+    strlcpy(e.category, category, sizeof(e.category));
+    strlcpy(e.message, message, sizeof(e.message));
+    s_evHead = (s_evHead + 1) % F1_EVENT_LOG_MAX;
+    if (s_evCount < F1_EVENT_LOG_MAX) s_evCount++;
+}
+
 /* AWS ALB cookies captured during negotiate, forwarded to WS upgrade */
 static char s_cookies[512] = {};
 
 /* WS frame reassembly */
-static char s_wsBuf[8192];
+static char s_wsBuf[4096];
 static int  s_wsBufLen = 0;
 
 /* ----------------------------------------------------------------
@@ -364,7 +391,7 @@ static bool negotiate(char* outToken, size_t tokenLen)
     }
 
     /* Read entire response (Connection: close → server closes when done) */
-    static char resp[4096];
+    static char resp[2048];
     int respLen = 0;
     unsigned long t0 = millis();
     while (respLen < (int)sizeof(resp) - 1 && millis() - t0 < TCP_TIMEOUT_MS) {
@@ -416,14 +443,14 @@ static bool wsConnect(const char* tokenEnc)
     }
 
     /* Build upgrade path */
-    static char path[2048];
+    static char path[1024];
     snprintf(path, sizeof(path),
         "%s?transport=webSockets&clientProtocol=1.5"
         "&connectionToken=%s&connectionData=%s",
         SR_CONNECT, tokenEnc, HUB_DATA_ENC);
 
     /* RFC 6455 upgrade request – include ALB cookies from negotiate */
-    static char req[3072];
+    static char req[1536];
     if (s_cookies[0]) {
         snprintf(req, sizeof(req),
             "GET %s HTTP/1.1\r\n"
@@ -541,6 +568,15 @@ static void processMessage(const char* msg, int len)
                             if (code[0]) {
                                 F1NetState ns = trackCodeToState(code);
                                 Serial.printf("[F1Net] TrackStatus=%s\n", code);
+                                /* Log the track status change */
+                                static const char* TRK_NAMES[] = {
+                                    "Idle","Green","Yellow","?","Safety Car",
+                                    "Red Flag","VSC","VSC Ending"};
+                                int ci = code[0] - '0';
+                                const char* tn = (ci>=0 && ci<=7) ? TRK_NAMES[ci] : code;
+                                char msg[F1_EVENT_MSG_LEN];
+                                snprintf(msg, sizeof(msg), "Track: %s", tn);
+                                logEvent("Track", msg);
                                 applyState(ns);
                             }
                         }
@@ -550,20 +586,35 @@ static void processMessage(const char* msg, int len)
                             char status[32] = {};
                             json_str(ap, "Status", status, sizeof(status));
                             Serial.printf("[F1Net] SessionStatus=%s\n", status);
+                            /* Log session status */
+                            char smsg[F1_EVENT_MSG_LEN];
+                            snprintf(smsg, sizeof(smsg), "Session: %s", status);
+                            logEvent("Session", smsg);
                             if (strstr(status, "Started")) {
                                 s_sessionActive = true;
+                                s_sessEndEpoch = 0;
                                 applyState(F1ST_SESSION_START);
                             } else if (strstr(status, "Finished") ||
                                        strstr(status, "Ends")) {
+                                s_sessEndEpoch = (uint32_t)time(nullptr);
                                 applyState(F1ST_CHEQUERED);
                             } else if (strstr(status, "Inactive")) {
                                 s_sessionActive = false;
+                                if (s_sessEndEpoch == 0)
+                                    s_sessEndEpoch = (uint32_t)time(nullptr);
                                 applyState(F1ST_IDLE);
                             }
                         }
                         else if (strcasecmp(topic, "RaceControlMessages") == 0) {
                             if (*ap == '"') { ++ap; }
                             while (*ap == ',' || *ap == ' ') ++ap;
+                            /* Extract the Message text for the event log */
+                            char rcMsg[F1_EVENT_MSG_LEN] = {};
+                            json_str(ap, "Message", rcMsg, sizeof(rcMsg));
+                            if (rcMsg[0]) {
+                                logEvent("RaceCtrl", rcMsg);
+                                Serial.printf("[F1Net] RaceCtrl: %s\n", rcMsg);
+                            }
                             /* Simple substring search – messages are small and well-known */
                             if (strstr(ap, "FASTEST LAP") || strstr(ap, "Fastest Lap")) {
                                 Serial.println("[F1Net] ↯ Fastest lap detected");
@@ -697,8 +748,8 @@ static void connectSignalR()
     if (s_connFails >= MAX_CONN_FAILS) return;
 
     /* Static: avoids 3 KB of stack. Safe – only called from single f1net task. */
-    static char token[1024];
-    static char tokenEnc[2048];
+    static char token[512];
+    static char tokenEnc[1280];
     token[0] = '\0';
     if (!negotiate(token, sizeof(token))) {
         s_connFails++;
@@ -783,6 +834,21 @@ void f1net_loop(void)
         return;
     }
 
+    /* ── Calendar API fetch request ──────────────────────────────────── */
+    if (f1cal_apiFetchRequested()) {
+        Serial.println("[F1Net] Calendar API fetch requested – tearing down WS");
+        if (s_tls) {
+            esp_tls_conn_destroy(s_tls);
+            s_tls = nullptr;
+        }
+        s_wsOpen    = false;
+        s_connected = false;
+        f1cal_fetchApi();
+        s_lastConnect = millis();
+        s_reconnDelay = RECONNECT_INIT_MS;
+        return;
+    }
+
     if (!s_wsOpen) {
         unsigned long now = millis();
         if (now - s_lastConnect >= s_reconnDelay) {
@@ -827,4 +893,39 @@ void f1net_disconnect(void)
         esp_tls_conn_destroy(s_tls);
         s_tls = nullptr;
     }
+}
+
+/* ── Live event log public API ──────────────────────────────────────── */
+
+int f1net_eventCount(void) {
+    /* Auto-clear check */
+    if (s_sessEndEpoch > 0 && s_evCount > 0) {
+        time_t now = time(nullptr);
+        if (now > (time_t)s_sessEndEpoch + 3600) {
+            s_evCount = 0;
+            s_evHead  = 0;
+            s_sessEndEpoch = 0;
+        }
+    }
+    return s_evCount;
+}
+
+bool f1net_getEvent(int idx, F1LiveEvent* out) {
+    if (idx < 0 || idx >= s_evCount || !out) return false;
+    int start;
+    if (s_evCount < F1_EVENT_LOG_MAX)
+        start = 0;
+    else
+        start = s_evHead;  /* oldest is at head in a full ring */
+    int pos = (start + idx) % F1_EVENT_LOG_MAX;
+    *out = s_eventLog[pos];
+    return true;
+}
+
+bool     f1net_sessionActive(void)    { return s_sessionActive; }
+uint32_t f1net_sessionEndEpoch(void)  { return s_sessEndEpoch; }
+
+void f1net_clearEvents(void) {
+    s_evCount = 0;
+    s_evHead  = 0;
 }

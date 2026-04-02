@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp</title>
+<link rel="stylesheet" href="/common.css">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<!-- status -->
+<div class="card">
+  <h2>Track Status</h2>
+  <div class="state-box" id="stateBox">Loading…</div>
+  <div class="info-row"><span>Network</span><span id="wifiInfo">Loading…</span></div>
+  <div class="info-row"><span>IP</span><span id="ipInfo" style="font-family:monospace;font-size:.8rem">—</span></div>
+  <div class="info-row"><span>Signal</span><span id="rssiInfo">—</span></div>
+  <div class="info-row"><span>F1 LiveTiming</span><span id="f1Ok">—</span></div>
+  <div class="info-row" id="raceRow" style="display:none"><span>Race Week</span><span id="raceLabel" style="color:#ffc800">—</span></div>
+  <div class="info-row" id="rampRow" style="display:none"><span>Idle ramp</span><span id="rampPct">—</span></div>
+  <div class="info-row"><span>Free heap</span><span id="heapInfo" style="font-size:.8rem">—</span></div>
+  <div id="effDetail" style="margin-top:10px;padding:10px;background:#222;border-radius:8px;display:none">
+    <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:6px">Current Effect</div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span id="effName" style="font-size:.85rem;font-weight:700;color:#ccc"></span>
+      <div style="display:flex;gap:3px;align-items:center">
+        <div id="effSwatch" style="width:22px;height:22px;border-radius:4px;border:1px solid #444"></div>
+        <div id="effSwatch2" style="width:22px;height:22px;border-radius:4px;border:1px solid #444;display:none"></div>
+      </div>
+      <span id="effSpd" style="font-size:.72rem;color:#666"></span>
+      <span id="effTag" style="font-size:.65rem;padding:2px 6px;border-radius:10px;display:none"></span>
+    </div>
+    <div id="effHex" style="font-size:.68rem;color:#555;margin-top:5px;font-family:monospace"></div>
+  </div>
+</div>
+
+<!-- force state -->
+<div class="card">
+  <h2>Force State (testing)</h2>
+  <div class="btn-grid" id="forceGrid"></div>
+  <button class="btn btn-outline btn-sm" onclick="forceState(255)">Clear Force</button>
+</div>
+
+<!-- brightness -->
+<div class="card">
+  <h2>Brightness</h2>
+  <div class="row">
+    <input type="range" min="1" max="255" id="briSlider" oninput="onBri(this.value)" style="flex:1">
+    <span id="briVal" style="font-size:.85rem;color:#888;width:28px;text-align:right">128</span>
+  </div>
+</div>
+
+<!-- next race weekend schedule -->
+<div class="card" id="nextRaceCard" style="display:none">
+  <h2 id="nrTitle">Next Race Weekend</h2>
+  <div id="nrMeta" style="margin-bottom:10px;font-size:.82rem;color:#888"></div>
+  <div id="nrSessions"></div>
+  <div id="nrError" style="color:#e10600;font-size:.85rem;display:none"></div>
+</div>
+
+<!-- live session events -->
+<div class="card" id="eventsCard" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <h2 style="margin:0">Live Session Events</h2>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="evLive" style="font-size:.7rem;padding:2px 8px;border-radius:10px;display:none">● LIVE</span>
+      <button class="btn btn-outline btn-sm" onclick="clearEvents()" style="font-size:.7rem;padding:2px 8px">Clear</button>
+    </div>
+  </div>
+  <div id="evStatus" style="font-size:.78rem;color:#666;margin-bottom:8px"></div>
+  <div id="evList" style="max-height:320px;overflow-y:auto"></div>
+  <div id="evEmpty" style="color:#555;font-size:.85rem;display:none">No events yet</div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+buildHeader();
+buildNav('home');
+
+let briTimer=null;
+function onBri(v){
+  document.getElementById('briVal').textContent=v;
+  clearTimeout(briTimer);
+  briTimer=setTimeout(()=>fetch('/api/bri?v='+v,{method:'POST'}),200);
+}
+async function forceState(s){await fetch('/api/force?s='+s,{method:'POST'});}
+
+function onStatus(d){
+  const idx=Math.min(d.state,SN.length-1);
+  const b=SB[idx]||'#333', f=SF[idx]||'#eee';
+  const sb=document.getElementById('stateBox');
+  sb.textContent=SN[idx]||'Unknown';
+  sb.style.background=b; sb.style.color=f;
+  document.getElementById('wifiInfo').textContent=d.ssid||(d.ap?'AP: F1-Lamp':'—');
+  document.getElementById('ipInfo').textContent=d.ip||'—';
+  const rssiEl=document.getElementById('rssiInfo');
+  if(d.rssi){const rs=d.rssi;const col=rs>-60?'#00d2be':rs>-75?'#ffc800':'#e10600';rssiEl.textContent=rs+' dBm';rssiEl.style.color=col;}else{rssiEl.textContent=d.ap?'AP mode':'—';}
+  document.getElementById('f1Ok').textContent=d.f1ok?'✓ Connected':'⏳ Waiting for session';
+  document.getElementById('f1Ok').style.color=d.f1ok?'#00d2be':'#aaa';
+  document.getElementById('briSlider').value=d.bri;
+  document.getElementById('briVal').textContent=d.bri;
+  const hasRace=d.nextRace&&d.nextRace!=='—';
+  document.getElementById('raceRow').style.display=hasRace?'flex':'none';
+  document.getElementById('raceLabel').textContent=d.nextRace||'';
+  const hasRamp=d.rampPct>0&&d.rampPct<100;
+  document.getElementById('rampRow').style.display=hasRamp?'flex':'none';
+  document.getElementById('rampPct').textContent=hasRamp?(d.rampPct+'%'):'';
+  document.getElementById('heapInfo').textContent=(d.heap/1024).toFixed(1)+' KB';
+  /* effect detail */
+  const ep=document.getElementById('effDetail');
+  if(d.eff){
+    ep.style.display='block';
+    const EN=['Solid','Pulse','Spinner','Strobe','Alt Letters','Rainbow Spin'];
+    document.getElementById('effName').textContent=EN[d.eff.e]||('Effect '+d.eff.e);
+    const c1=rgb2hex(d.eff.r,d.eff.g,d.eff.b);
+    document.getElementById('effSwatch').style.background=c1;
+    const s2=document.getElementById('effSwatch2');
+    if(d.eff.e===4){s2.style.display='inline-block';s2.style.background=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2);}else{s2.style.display='none';}
+    document.getElementById('effSpd').textContent='Speed: '+d.eff.spd;
+    const tag=document.getElementById('effTag');
+    if(d.eff.fl){tag.style.display='inline';tag.textContent='\u26a1 Flash';tag.style.background='#3a2a00';tag.style.color='#ffc800';}
+    else if(d.eff.rp){tag.style.display='inline';tag.textContent='\u25b6 Replay';tag.style.background='#1a3a1a';tag.style.color='#6f6';}
+    else{tag.style.display='none';}
+    let hexTxt='Color: '+c1.toUpperCase()+' ('+d.eff.r+','+d.eff.g+','+d.eff.b+')';
+    if(d.eff.e===4){const c2=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2).toUpperCase();hexTxt+='  /  '+c2+' ('+d.eff.r2+','+d.eff.g2+','+d.eff.b2+')';}
+    document.getElementById('effHex').textContent=hexTxt;
+  }else{ep.style.display='none';}
+}
+
+/* force state grid */
+(function(){
+  const g=document.getElementById('forceGrid');
+  SN.forEach((n,i)=>{
+    const b=document.createElement('button');
+    b.className='btn btn-sm';b.textContent=n;
+    b.style.background=SB[i];b.style.color=SF[i];
+    b.onclick=()=>forceState(i);
+    g.appendChild(b);
+  });
+  setTimeout(()=>pollStatus(onStatus),300);
+  setInterval(()=>pollStatus(onStatus),2000);
+  /* Fetch next race schedule */
+  loadNextRace();
+})();
+
+/* ── Next Race Weekend ──────────────────────────────────────────────── */
+async function loadNextRace(){
+  const card=document.getElementById('nextRaceCard');
+  const errEl=document.getElementById('nrError');
+  try{
+    let d;
+    for(let i=0;i<20;i++){
+      d=await(await fetch('/api/nextrace')).json();
+      if(!d.loading) break;
+      await new Promise(r=>setTimeout(r,1500));
+    }
+    if(d.loading){errEl.textContent='Still loading calendar…';errEl.style.display='block';card.style.display='block';return;}
+    if(d.error){errEl.textContent='Error: '+d.error;errEl.style.display='block';card.style.display='block';return;}
+    if(!d.raceName){return;} /* no data yet */
+    card.style.display='block';
+    /* Title */
+    document.getElementById('nrTitle').textContent=d.raceName;
+    /* Meta: circuit, location */
+    let meta='';
+    if(d.circuit) meta+=d.circuit;
+    if(d.locality) meta+=' — '+d.locality;
+    if(d.country) meta+=', '+d.country;
+    if(d.round) meta+=' (Round '+d.round+')';
+    document.getElementById('nrMeta').textContent=meta;
+    /* Sessions table */
+    const cont=document.getElementById('nrSessions');
+    if(!d.sessions||!d.sessions.length){cont.innerHTML='<span style="color:#555">No session data</span>';return;}
+    const now=new Date();
+    /* Format options for local time */
+    const dayOpts={weekday:'short',month:'short',day:'numeric'};
+    const timeOpts={hour:'2-digit',minute:'2-digit',hour12:false};
+    let html='<div style="display:grid;grid-template-columns:1fr auto auto;gap:4px 12px;align-items:center">';
+    /* Header */
+    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px">Session</div>';
+    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px;text-align:right">Day</div>';
+    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px;text-align:right">Time</div>';
+    d.sessions.forEach(s=>{
+      const dt=new Date(s.dateTime);
+      const isPast=dt<now;
+      const isToday=dt.toDateString()===now.toDateString();
+      const isSoon=!isPast&&(dt-now)<3600000; /* within 1h */
+      const dayStr=dt.toLocaleDateString(undefined,dayOpts);
+      const timeStr=dt.toLocaleTimeString(undefined,timeOpts);
+      let nameColor=isPast?'#555':s.name==='Race'?'#e10600':'#ccc';
+      let timeColor=isPast?'#444':isSoon?'#ffc800':isToday?'#00d2be':'#888';
+      let badge='';
+      if(isPast) badge=' <span style="font-size:.6rem;color:#444">✓</span>';
+      else if(isSoon) badge=' <span style="font-size:.6rem;color:#ffc800">SOON</span>';
+      html+='<div style="font-size:.85rem;font-weight:'+(s.name==='Race'?'700':'400')+';color:'+nameColor+'">'+escHtml(s.name)+badge+'</div>';
+      html+='<div style="font-size:.82rem;color:'+timeColor+';text-align:right">'+dayStr+'</div>';
+      html+='<div style="font-size:.82rem;color:'+timeColor+';text-align:right;font-family:monospace">'+timeStr+'</div>';
+    });
+    html+='</div>';
+    /* Source indicator */
+    html+='<div style="margin-top:8px;font-size:.65rem;color:#444">Source: '+(d.fromApi?'f1calendar.com (online)':'Built-in calendar')+'</div>';
+    cont.innerHTML=html;
+  }catch(e){errEl.textContent='Failed: '+e.message;errEl.style.display='block';card.style.display='block';}
+}
+
+/* ── Live Session Events ──────────────────────────────────────────── */
+let evTimer=null, lastEvCount=0;
+const CAT_COLORS={Track:'#ffc800',Session:'#00d2be',RaceCtrl:'#e10600'};
+
+async function loadEvents(){
+  try{
+    const d=await(await fetch('/api/events')).json();
+    const card=document.getElementById('eventsCard');
+    const evts=d.events||[];
+    const liveEl=document.getElementById('evLive');
+    const statusEl=document.getElementById('evStatus');
+
+    /* Show card if session active/connected or events exist */
+    if(!d.active&&!d.connected&&evts.length===0&&!d.sessionEnd){
+      card.style.display='none'; return;
+    }
+    card.style.display='block';
+
+    /* Live badge */
+    if(d.active&&d.connected){
+      liveEl.style.display='inline';liveEl.style.background='#1a3a1a';liveEl.style.color='#0f0';
+    } else if(d.connected){
+      liveEl.style.display='inline';liveEl.style.background='#2a2a00';liveEl.style.color='#ffc800';liveEl.textContent='● CONNECTED';
+    } else {
+      liveEl.style.display='none';
+    }
+    if(d.active) liveEl.textContent='● LIVE';
+
+    /* Status line */
+    let st='';
+    if(d.active) st='Session in progress';
+    else if(d.sessionEnd>0){
+      const endDate=new Date(d.sessionEnd*1000);
+      const clearDate=new Date((d.sessionEnd+3600)*1000);
+      const timeOpts={hour:'2-digit',minute:'2-digit',hour12:false};
+      st='Session ended at '+endDate.toLocaleTimeString(undefined,timeOpts)+' — events clear at '+clearDate.toLocaleTimeString(undefined,timeOpts);
+    }
+    statusEl.textContent=st;
+
+    /* Event list */
+    const listEl=document.getElementById('evList');
+    const emptyEl=document.getElementById('evEmpty');
+    if(evts.length===0){
+      listEl.innerHTML='';emptyEl.style.display='block'; return;
+    }
+    emptyEl.style.display='none';
+
+    /* Only rebuild if count changed */
+    if(evts.length!==lastEvCount){
+      lastEvCount=evts.length;
+      const timeOpts={hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false};
+      let html='';
+      /* Show newest first */
+      for(let i=evts.length-1;i>=0;i--){
+        const e=evts[i];
+        const t=new Date(e.t*1000);
+        const ts=t.toLocaleTimeString(undefined,timeOpts);
+        const catCol=CAT_COLORS[e.cat]||'#888';
+        html+='<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #222">';
+        html+='<span style="font-size:.72rem;color:#555;font-family:monospace;min-width:58px">'+ts+'</span>';
+        html+='<span style="font-size:.65rem;padding:1px 5px;border-radius:8px;background:'+catCol+'22;color:'+catCol+';min-width:52px;text-align:center">'+escHtml(e.cat)+'</span>';
+        html+='<span style="font-size:.82rem;color:#ccc;flex:1">'+escHtml(e.msg)+'</span>';
+        html+='</div>';
+      }
+      listEl.innerHTML=html;
+    }
+  }catch(e){/* ignore */}
+}
+
+async function clearEvents(){
+  await fetch('/api/events/clear',{method:'POST'});
+  lastEvCount=0;
+  loadEvents();
+}
+
+/* Poll events — faster when session active */
+function startEventPoll(){
+  loadEvents();
+  if(evTimer) clearInterval(evTimer);
+  evTimer=setInterval(loadEvents,5000);
+}
+startEventPoll();
+</script>
+</body></html>

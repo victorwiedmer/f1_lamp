@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – Features</title>
+<link rel="stylesheet" href="/common.css">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<div class="card">
+  <h2>Live Event Features</h2>
+  <small style="display:block;color:#555;margin-bottom:10px">Automatic LED effects from live F1 telemetry. Requires a live timing connection.</small>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#127942; Winner Celebration</div>
+      <div class="feat-desc">Rainbow spinner on chequered flag. Lasts until the next state change.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_winner" onchange="saveFeature('winner',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#128156; Fastest Lap Flash</div>
+      <div class="feat-desc">3&thinsp;s purple strobe when a driver sets the overall fastest lap.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_fastest_lap" onchange="saveFeature('fastest_lap',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#9989; DRS Open Flash</div>
+      <div class="feat-desc">Brief white pulse when DRS detection zones open. Disabled by default.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_drs" onchange="saveFeature('drs',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#128308; Start Lights</div>
+      <div class="feat-desc">5 red LED segments light up one-by-one then go dark on session start.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_start_lights" onchange="saveFeature('start_lights',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div>
+      <div class="feat-title">&#128564; Deep Sleep</div>
+      <div class="feat-desc">Outside race weekends the lamp sleeps (5&thinsp;&micro;A). Requires battery; disabled by default.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_deep_sleep" onchange="saveFeature('deep_sleep',this.checked)">
+  </div>
+  <hr>
+  <div style="font-size:.7rem;color:#555;margin-bottom:6px">Test without a live session:</div>
+  <div style="display:flex;flex-wrap:wrap;gap:5px">
+    <button class="btn btn-sm" style="background:#2a1a3a;color:#c080ff;border:1px solid #7040a0" onclick="testEvent(0)">&#127942; Winner</button>
+    <button class="btn btn-sm" style="background:#2a1a3a;color:#c080ff;border:1px solid #7040a0" onclick="testEvent(1)">&#128156; Fastest Lap</button>
+    <button class="btn btn-sm" style="background:#2a2a2a;color:#ccc;border:1px solid #555" onclick="testEvent(2)">&#9989; DRS Open</button>
+    <button class="btn btn-sm" style="background:#3a0a0a;color:#ff8080;border:1px solid #e10600" onclick="testEvent(3)">&#128308; Start Lights</button>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+buildHeader();
+buildNav('features');
+
+async function loadFeatures(){
+  try{
+    const d=await(await fetch('/api/features')).json();
+    document.getElementById('feat_winner').checked       = d.winner        ||false;
+    document.getElementById('feat_fastest_lap').checked  = d.fastest_lap   ||false;
+    document.getElementById('feat_drs').checked          = d.drs           ||false;
+    document.getElementById('feat_start_lights').checked = d.start_lights  ||false;
+    document.getElementById('feat_deep_sleep').checked   = d.deep_sleep    ||false;
+  }catch(e){}
+}
+async function saveFeature(name,val){
+  await fetch('/api/features',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[name]:val})});
+}
+async function testEvent(ev){
+  await fetch('/api/test_event?ev='+ev,{method:'POST'});
+}
+
+setTimeout(loadFeatures,300);
+pollStatus();
+setInterval(()=>pollStatus(),5000);
+</script>
+</body></html>
