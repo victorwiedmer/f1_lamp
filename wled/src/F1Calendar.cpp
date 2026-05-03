@@ -11,6 +11,7 @@
  */
 
 #include "F1Calendar.h"
+#include "F1TimeUtils.h"   /* f1_parseUtc, f1_weekendWindowActive, f1_idleBrightnessFactor */
 #include <Arduino.h>
 #include <time.h>
 #include <LittleFS.h>
@@ -105,24 +106,11 @@ static int s_dynCount = 0;
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-/* Parse "YYYY-MM-DD" + "HH:MM:SSZ" into a UTC epoch.
-   If timeStr is nullptr the time part defaults to 00:00:00. */
-static time_t parseUtc(const char* dateStr, const char* timeStr) {
-    if (!dateStr || !dateStr[0]) return 0;
-    struct tm t = {};
-    int year, mon, day;
-    if (sscanf(dateStr, "%d-%d-%d", &year, &mon, &day) != 3) return 0;
-    t.tm_year = year - 1900;
-    t.tm_mon  = mon  - 1;
-    t.tm_mday = day;
-    if (timeStr && timeStr[0]) {
-        int h, m, s;
-        sscanf(timeStr, "%d:%d:%d", &h, &m, &s);
-        t.tm_hour = h; t.tm_min = m; t.tm_sec = s;
-    }
-    t.tm_isdst = -1;
-    /* NTP sets TZ=UTC (configTime offset=0,0), so mktime treats as UTC */
-    return mktime(&t);
+/* parseUtc is now provided by F1TimeUtils.h as f1_parseUtc.  Thin wrapper
+   keeps existing call sites unchanged. */
+static inline time_t parseUtc(const char* dateStr, const char* timeStr)
+{
+    return f1_parseUtc(dateStr, timeStr);
 }
 
 /* Shorten a long race name to ≤ 24 chars for the label. */
@@ -293,27 +281,9 @@ bool f1cal_update() {
 
 float f1cal_idleFactor() {
     if (!s_hasData) return 0.0f;
-
-    time_t now = time(nullptr);
-
-    /* Use first session time as the "100 % brightness" target if available,
-       otherwise race day midnight */
+    time_t now    = time(nullptr);
     time_t target = (s_firstSessEpoch > 0) ? s_firstSessEpoch : s_raceEpoch;
-
-    double diffSec  = difftime(target, now);
-    double diffDays = diffSec / 86400.0;
-
-    /* After first session start → race is live, normal brightness rules apply */
-    if (diffDays < 0.0) return 0.0f;
-
-    /* More than 7 days away → no ramp yet */
-    if (diffDays > 7.0) return 0.0f;
-
-    /* Linear: 7 days out = 5 %, 0 days = 100 % */
-    float factor = 1.0f - (float)(diffDays / 7.0) * 0.95f;
-    if (factor < 0.05f) factor = 0.05f;
-    if (factor > 1.0f)  factor = 1.0f;
-    return factor;
+    return f1_idleBrightnessFactor(now, target);
 }
 
 bool f1cal_hasData() { return s_hasData; }
@@ -321,11 +291,7 @@ bool f1cal_hasData() { return s_hasData; }
 bool f1cal_weekendActive() {
     if (!s_hasData) return false;
     time_t now = time(nullptr);
-    /* Allow 30 min before FP1; end of window = race day midnight + 27 h
-       (covers any race regardless of local start time + ~3 h duration). */
-    time_t winStart = s_firstSessEpoch - 1800;
-    time_t winEnd   = s_raceEpoch + 97200;   /* 27 h after race-day midnight */
-    return (now >= winStart && now < winEnd);
+    return f1_weekendWindowActive(now, s_firstSessEpoch, s_raceEpoch);
 }
 
 uint32_t f1cal_sleepSeconds() {

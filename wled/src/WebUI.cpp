@@ -25,6 +25,8 @@
 
 bool g_apMode = false;
 
+#define FW_VERSION "1.0.0-2026.05.02"
+
 /* ── global server instance (port 80) ───────────────────────────────────── */
 static AsyncWebServer s_server(80);
 
@@ -163,7 +165,8 @@ void webui_init(
         serveFile(req, "/common.css", "text/css", true);
     });
     s_server.on("/common.js", HTTP_GET, [](AsyncWebServerRequest* req) {
-        serveFile(req, "/common.js", "application/javascript", true);
+        /* no-cache: JS changes with every firmware build */
+        serveFile(req, "/common.js", "application/javascript", false);
     });
     s_server.on("/effects.html", HTTP_GET, [](AsyncWebServerRequest* req) {
         serveFile(req, "/effects.html", "text/html");
@@ -194,6 +197,7 @@ void webui_init(
         doc["nextRace"]  = f1cal_hasData() ? f1cal_nextRaceLabel() : "—";
         doc["rampPct"]   = (int)(f1cal_idleFactor() * 100.0f);
         doc["heap"]      = (int)ESP.getFreeHeap();
+        doc["version"]   = FW_VERSION;
         doc["ip"]        = WiFi.localIP().toString();
         doc["rssi"]      = (int)WiFi.RSSI();
         /* active effect details */

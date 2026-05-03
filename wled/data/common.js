@@ -40,7 +40,10 @@ function buildHeader(){
   if(!hdr) return;
   hdr.innerHTML=`
     <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0 4px">
-      <h1>&#9873; F1 Lamp</h1>
+      <div>
+        <h1 style="margin:0">&#9873; F1 Lamp</h1>
+        <span id="fwVer" style="font-size:.62rem;color:#555;letter-spacing:.5px"></span>
+      </div>
       <div style="display:flex;gap:8px;align-items:center">
         <span class="badge" id="netBadge" style="background:#333;color:#888">&mdash;</span>
         <button id="pwrBtn" class="btn pwr-btn" onclick="togglePower()">ON</button>
@@ -60,6 +63,8 @@ async function togglePower(){
 async function pollStatus(fullCb){
   try{
     const d=await(await fetchWithTimeout('/api/status',4000)).json();
+    const vr=document.getElementById('fwVer');
+    if(vr && d.version) vr.textContent='v'+d.version;
     const nb=document.getElementById('netBadge');
     if(nb){
       nb.textContent=d.ap?'AP Mode':('✓ '+d.ssid);

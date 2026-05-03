@@ -6,8 +6,9 @@
  * *** ESPAsyncWebServer defines HTTP_GET/DELETE/etc. as C enum values ***
  * *** that conflict with the same identifiers in esp-idf/http_parser. ***
  *
- * Implementation uses the ESP-IDF esp_tls API for HTTPS/WSS connections
- * to the F1 live-timing SignalR service.
+ * Uses raw mbedTLS + lwIP sockets (same approach as F1Sessions.cpp)
+ * because esp_tls has TLS compiled out in this SDK build
+ * (CONFIG_MBEDTLS_TLS_DISABLED=1).
  *
  * Protocol flow:
  *   HTTPS GET /signalr/negotiate  →  ConnectionToken + ALB cookies
@@ -19,25 +20,33 @@
  *   Reconnect with exponential back-off on disconnect
  */
 
-#include <WiFi.h>           /* Arduino WiFi – brings in WiFiClient     */
+#include <WiFi.h>           /* Arduino WiFi                            */
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <Arduino.h>        /* millis(), Serial                        */
 
-/* ESP-IDF TLS */
-extern "C" {
-#include "esp_tls.h"
-#include "esp_crt_bundle.h"
-}
+/* raw mbedTLS */
+#include "mbedtls/ssl.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
+
+/* lwIP raw sockets */
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+#include <lwip/inet.h>
+
+/* FreeRTOS */
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "F1NetWork.h"
 #include "F1Sessions.h"
 #include "F1Calendar.h"
-
-/* For select() / fd_set on ESP-IDF */
-#include <sys/select.h>
+#include "F1StringUtils.h"  /* f1_url_encode, f1_json_str */
 
 /* ----------------------------------------------------------------
    Tunables
@@ -73,15 +82,25 @@ static volatile bool        s_connected   = false;
 static F1NetStateCB         s_callback    = nullptr;
 static F1EventCB            s_eventCallback = nullptr;
 
-static esp_tls_t*  s_tls         = nullptr;   /* persistent WSS connection    */
+/* ----------------------------------------------------------------
+   TlsConn – mbedTLS + raw lwIP socket (same struct as F1Sessions.cpp)
+   ---------------------------------------------------------------- */
+struct TlsConn {
+    int                      sock;
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context  entropy;
+    bool                     connected;
+};
+
+static TlsConn*    s_tls         = nullptr;   /* persistent WSS connection    */
 static bool        s_wsOpen       = false;
 static uint32_t    s_reconnDelay  = RECONNECT_INIT_MS;
 static unsigned long s_lastConnect = 0;
 static unsigned long s_lastPing    = 0;
 static unsigned long s_lastData    = 0;  /* last ws frame received */
 static bool        s_sessionActive = false;
-static int         s_connFails    = 2;   /* start disabled – esp_tls has TLS compiled out, crashes on connect */
-static constexpr int MAX_CONN_FAILS = 2; /* stop retrying after this many    */
 
 /* ── Live event ring buffer ──────────────────────────────────────────── */
 static F1LiveEvent s_eventLog[F1_EVENT_LOG_MAX];
@@ -119,41 +138,16 @@ static int  s_wsBufLen = 0;
    Helpers
    ---------------------------------------------------------------- */
 
-/* URL-encode src into dst.  Returns dst. */
+/* Thin wrappers – implementations live in F1StringUtils.h for testability */
 static char* url_encode(const char* src, char* dst, size_t dst_size)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j + 4 < dst_size; ++i) {
-        unsigned char c = (unsigned char)src[i];
-        if (isalnum(c) || c=='_' || c=='-' || c=='.' || c=='~') {
-            dst[j++] = (char)c;
-        } else {
-            dst[j++] = '%';
-            dst[j++] = hex[c >> 4];
-            dst[j++] = hex[c & 0xF];
-        }
-    }
-    dst[j] = '\0';
-    return dst;
+    return f1_url_encode(src, dst, dst_size);
 }
 
-/* Extract JSON string value: {"key":"<value>",...} */
 static bool json_str(const char* json, const char* key,
                      char* out, size_t out_size)
 {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-    const char* p = strstr(json, search);
-    if (!p) return false;
-    p += strlen(search);
-    while (*p == ' ' || *p == ':') ++p;
-    if (*p != '"') return false;
-    ++p;
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < out_size) out[n++] = *p++;
-    out[n] = '\0';
-    return n > 0;
+    return f1_json_str(json, key, out, out_size);
 }
 
 /* Map TrackStatus code → F1NetState */
@@ -180,13 +174,17 @@ static void applyState(F1NetState ns)
     if (s_callback) s_callback(ns);
 }
 
+/* forward declaration – defined in TLS helpers block below */
+static void tls_cleanup(TlsConn& c);
+
 /* Schedule reconnect with back-off */
 static void scheduleReconnect()
 {
     s_wsOpen     = false;
     s_connected  = false;
     if (s_tls) {
-        esp_tls_conn_destroy(s_tls);
+        tls_cleanup(*s_tls);
+        delete s_tls;
         s_tls = nullptr;
     }
     s_lastConnect = millis();
@@ -197,84 +195,196 @@ static void scheduleReconnect()
 }
 
 /* ----------------------------------------------------------------
-   TLS I/O helpers
+   TLS I/O helpers  (mbedTLS + lwIP sockets)
    ---------------------------------------------------------------- */
 
-/* Write all bytes over TLS (handles partial writes) */
-static bool tls_write_all(esp_tls_t* tls, const void* data, size_t len)
+/* BIO callbacks */
+static int bio_send(void* ctx, const unsigned char* buf, size_t len)
+{
+    int fd = *(int*)ctx;
+    int r = lwip_send(fd, buf, len, 0);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    return r;
+}
+
+static int bio_recv(void* ctx, unsigned char* buf, size_t len)
+{
+    int fd = *(int*)ctx;
+    int r = lwip_recv(fd, buf, len, 0);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_READ;
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    return r;
+}
+
+static void tls_cleanup(TlsConn& c)
+{
+    if (c.connected) mbedtls_ssl_close_notify(&c.ssl);
+    mbedtls_ssl_free(&c.ssl);
+    mbedtls_ssl_config_free(&c.conf);
+    mbedtls_ctr_drbg_free(&c.ctr_drbg);
+    mbedtls_entropy_free(&c.entropy);
+    if (c.sock >= 0) { lwip_close(c.sock); c.sock = -1; }
+    c.connected = false;
+}
+
+/* Open a fresh TLS connection to SR_HOST:SR_PORT */
+static bool tls_connect(TlsConn& c)
+{
+    char errbuf[128];
+    c.sock = -1;
+    c.connected = false;
+
+    mbedtls_ssl_init(&c.ssl);
+    mbedtls_ssl_config_init(&c.conf);
+    mbedtls_ctr_drbg_init(&c.ctr_drbg);
+    mbedtls_entropy_init(&c.entropy);
+
+    int ret = mbedtls_ctr_drbg_seed(&c.ctr_drbg, mbedtls_entropy_func,
+                                      &c.entropy, nullptr, 0);
+    if (ret != 0) {
+        mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+        Serial.printf("[F1Net] DRBG seed: %s\n", errbuf);
+        tls_cleanup(c); return false;
+    }
+    ret = mbedtls_ssl_config_defaults(&c.conf, MBEDTLS_SSL_IS_CLIENT,
+                                       MBEDTLS_SSL_TRANSPORT_STREAM,
+                                       MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+        mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+        Serial.printf("[F1Net] SSL config: %s\n", errbuf);
+        tls_cleanup(c); return false;
+    }
+    mbedtls_ssl_conf_authmode(&c.conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&c.conf, mbedtls_ctr_drbg_random, &c.ctr_drbg);
+
+    ret = mbedtls_ssl_setup(&c.ssl, &c.conf);
+    if (ret != 0) {
+        mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+        Serial.printf("[F1Net] SSL setup: %s\n", errbuf);
+        tls_cleanup(c); return false;
+    }
+    ret = mbedtls_ssl_set_hostname(&c.ssl, SR_HOST);
+    if (ret != 0) {
+        mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+        Serial.printf("[F1Net] set_hostname: %s\n", errbuf);
+        tls_cleanup(c); return false;
+    }
+
+    /* TCP connect */
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portStr[8];
+    snprintf(portStr, sizeof(portStr), "%d", SR_PORT);
+    ret = lwip_getaddrinfo(SR_HOST, portStr, &hints, &res);
+    if (ret != 0 || !res) {
+        Serial.printf("[F1Net] DNS failed: %d\n", ret);
+        tls_cleanup(c); return false;
+    }
+    {
+        struct sockaddr_in* sa = (struct sockaddr_in*)res->ai_addr;
+        Serial.printf("[F1Net] Resolved %s -> %s\n", SR_HOST, inet_ntoa(sa->sin_addr));
+    }
+    bool tcpOk = false;
+    for (int attempt = 0; attempt < 3 && !tcpOk; attempt++) {
+        if (attempt > 0) {
+            Serial.printf("[F1Net] TCP retry %d/3...\n", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+        c.sock = lwip_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (c.sock < 0) continue;
+        struct timeval tv;
+        tv.tv_sec  = TCP_TIMEOUT_MS / 1000;
+        tv.tv_usec = (TCP_TIMEOUT_MS % 1000) * 1000;
+        lwip_setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        lwip_setsockopt(c.sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (lwip_connect(c.sock, res->ai_addr, res->ai_addrlen) == 0) {
+            tcpOk = true;
+        } else {
+            lwip_close(c.sock); c.sock = -1;
+        }
+    }
+    lwip_freeaddrinfo(res);
+    if (!tcpOk) {
+        Serial.println("[F1Net] TCP connect failed");
+        tls_cleanup(c); return false;
+    }
+
+    mbedtls_ssl_set_bio(&c.ssl, &c.sock, bio_send, bio_recv, nullptr);
+
+    unsigned long t0 = millis();
+    while ((ret = mbedtls_ssl_handshake(&c.ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+            Serial.printf("[F1Net] TLS handshake failed: %s (0x%x)\n", errbuf, -ret);
+            tls_cleanup(c); return false;
+        }
+        if (millis() - t0 > TCP_TIMEOUT_MS) {
+            Serial.println("[F1Net] TLS handshake timeout");
+            tls_cleanup(c); return false;
+        }
+        delay(1);
+    }
+    c.connected = true;
+    Serial.println("[F1Net] TLS handshake OK");
+    return true;
+}
+
+/* Write all bytes over TLS */
+static bool tls_write_all(TlsConn& c, const void* data, size_t len)
 {
     const uint8_t* p = (const uint8_t*)data;
     size_t sent = 0;
     unsigned long t0 = millis();
     while (sent < len && millis() - t0 < TCP_TIMEOUT_MS) {
-        ssize_t r = esp_tls_conn_write(tls, p + sent, len - sent);
+        int r = mbedtls_ssl_write(&c.ssl, p + sent, len - sent);
         if (r > 0) {
             sent += (size_t)r;
-        } else if (r == 0) {
+        } else if (r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             delay(1);
         } else {
-            Serial.printf("[F1Net] TLS write error: %d\n", (int)r);
+            Serial.printf("[F1Net] TLS write error: 0x%x\n", -r);
             return false;
         }
     }
     return sent == len;
 }
 
-/* Check if socket has data available (non-blocking) */
-static bool tls_data_available(esp_tls_t* tls)
+/* Check if socket has data available without blocking */
+static bool tls_data_available(TlsConn& c)
 {
-    if (!tls) return false;
-    int sockfd = -1;
-    if (esp_tls_get_conn_sockfd(tls, &sockfd) != ESP_OK || sockfd < 0)
-        return false;
+    if (c.sock < 0) return false;
     fd_set fds;
     FD_ZERO(&fds);
-    FD_SET(sockfd, &fds);
+    FD_SET(c.sock, &fds);
     struct timeval tv = {0, 0};
-    return select(sockfd + 1, &fds, nullptr, nullptr, &tv) > 0;
+    return select(c.sock + 1, &fds, nullptr, nullptr, &tv) > 0;
 }
 
 /* Read exactly 'len' bytes with timeout */
-static int tls_read_exact(esp_tls_t* tls, uint8_t* buf, size_t len,
-                          uint32_t timeout_ms)
+static int tls_read_exact(TlsConn& c, uint8_t* buf, size_t len,
+                           uint32_t timeout_ms)
 {
     size_t got = 0;
     unsigned long t0 = millis();
     while (got < len && millis() - t0 < timeout_ms) {
-        ssize_t r = esp_tls_conn_read(tls, buf + got, len - got);
+        int r = mbedtls_ssl_read(&c.ssl, buf + got, len - got);
         if (r > 0) {
             got += (size_t)r;
-        } else if (r == 0) {
-            return -1;  /* connection closed */
-        } else {
-            /* WANT_READ / WANT_WRITE → retry after tiny delay */
+        } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            return -1;
+        } else if (r == MBEDTLS_ERR_SSL_WANT_READ) {
             delay(1);
+        } else {
+            return -1;
         }
     }
     return (int)got;
-}
-
-/* Open a fresh TLS connection to SR_HOST:SR_PORT */
-static esp_tls_t* tls_connect()
-{
-    esp_tls_cfg_t cfg = {};
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.timeout_ms = TCP_TIMEOUT_MS;
-    cfg.non_block  = false;
-
-    esp_tls_t* tls = esp_tls_init();
-    if (!tls) {
-        Serial.println("[F1Net] esp_tls_init failed");
-        return nullptr;
-    }
-    int ret = esp_tls_conn_new_sync(SR_HOST, strlen(SR_HOST),
-                                     SR_PORT, &cfg, tls);
-    if (ret != 1) {
-        Serial.printf("[F1Net] TLS connect failed: %d\n", ret);
-        esp_tls_conn_destroy(tls);
-        return nullptr;
-    }
-    return tls;
 }
 
 /* ----------------------------------------------------------------
@@ -315,7 +425,7 @@ static void extractCookies(const char* headers, char* out, size_t outLen)
    ---------------------------------------------------------------- */
 
 /* Send a text frame from client (mask bit set, 4-byte mask) */
-static void ws_send_text(esp_tls_t* tls, const char* payload)
+static void ws_send_text(TlsConn& c, const char* payload)
 {
     size_t len = strlen(payload);
     uint8_t hdr[14];
@@ -338,7 +448,7 @@ static void ws_send_text(esp_tls_t* tls, const char* payload)
     memcpy(hdr + hdrLen, mask, 4);
     hdrLen += 4;
 
-    tls_write_all(tls, hdr, hdrLen);
+    tls_write_all(c, hdr, hdrLen);
 
     /* Write masked payload */
     char masked[256];
@@ -350,17 +460,17 @@ static void ws_send_text(esp_tls_t* tls, const char* payload)
         for (size_t i = 0; i < chunk; ++i) {
             masked[i] = p[i] ^ mask[mi++ & 3];
         }
-        tls_write_all(tls, masked, chunk);
+        tls_write_all(c, masked, chunk);
         p += chunk;
         remaining -= chunk;
     }
 }
 
 /* Send WS ping frame */
-static void ws_send_ping(esp_tls_t* tls)
+static void ws_send_ping(TlsConn& c)
 {
     uint8_t frame[6] = {0x89, 0x80, 0x00, 0x00, 0x00, 0x00};  /* FIN+ping, masked, len=0 */
-    tls_write_all(tls, frame, sizeof(frame));
+    tls_write_all(c, frame, sizeof(frame));
 }
 
 /* ----------------------------------------------------------------
@@ -368,9 +478,12 @@ static void ws_send_ping(esp_tls_t* tls)
    ---------------------------------------------------------------- */
 static bool negotiate(char* outToken, size_t tokenLen)
 {
-    esp_tls_t* tls = tls_connect();
-    if (!tls) {
+    TlsConn* cp = new (std::nothrow) TlsConn;
+    if (!cp) { Serial.println("[F1Net] OOM negotiate"); return false; }
+
+    if (!tls_connect(*cp)) {
         Serial.println("[F1Net] Neg TLS connect fail");
+        delete cp;
         return false;
     }
 
@@ -384,9 +497,9 @@ static bool negotiate(char* outToken, size_t tokenLen)
         "\r\n",
         SR_NEGOTIATE, HUB_DATA_ENC, SR_HOST);
 
-    if (!tls_write_all(tls, req, strlen(req))) {
+    if (!tls_write_all(*cp, req, strlen(req))) {
         Serial.println("[F1Net] Neg write fail");
-        esp_tls_conn_destroy(tls);
+        tls_cleanup(*cp); delete cp;
         return false;
     }
 
@@ -395,18 +508,21 @@ static bool negotiate(char* outToken, size_t tokenLen)
     int respLen = 0;
     unsigned long t0 = millis();
     while (respLen < (int)sizeof(resp) - 1 && millis() - t0 < TCP_TIMEOUT_MS) {
-        ssize_t r = esp_tls_conn_read(tls, resp + respLen,
-                                       sizeof(resp) - 1 - respLen);
+        int r = mbedtls_ssl_read(&cp->ssl,
+                    (unsigned char*)resp + respLen,
+                    sizeof(resp) - 1 - respLen);
         if (r > 0) {
-            respLen += (int)r;
-        } else if (r == 0) {
-            break;  /* server closed connection */
+            respLen += r;
+        } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        } else if (r == MBEDTLS_ERR_SSL_WANT_READ) {
+            delay(1);
         } else {
-            delay(1);  /* WANT_READ → retry */
+            break;
         }
     }
     resp[respLen] = '\0';
-    esp_tls_conn_destroy(tls);
+    tls_cleanup(*cp); delete cp;
 
     /* Parse status line */
     int statusCode = 0;
@@ -436,9 +552,12 @@ static bool negotiate(char* outToken, size_t tokenLen)
    ---------------------------------------------------------------- */
 static bool wsConnect(const char* tokenEnc)
 {
-    s_tls = tls_connect();
-    if (!s_tls) {
+    TlsConn* cp = new (std::nothrow) TlsConn;
+    if (!cp) { Serial.println("[F1Net] OOM wsConnect"); return false; }
+
+    if (!tls_connect(*cp)) {
         Serial.println("[F1Net] WS TLS connect fail");
+        delete cp;
         return false;
     }
 
@@ -476,10 +595,9 @@ static bool wsConnect(const char* tokenEnc)
             path, SR_HOST);
     }
 
-    if (!tls_write_all(s_tls, req, strlen(req))) {
+    if (!tls_write_all(*cp, req, strlen(req))) {
         Serial.println("[F1Net] WS upgrade write fail");
-        esp_tls_conn_destroy(s_tls);
-        s_tls = nullptr;
+        tls_cleanup(*cp); delete cp;
         return false;
     }
 
@@ -488,13 +606,16 @@ static bool wsConnect(const char* tokenEnc)
     int rlen = 0;
     unsigned long t0 = millis();
     while (rlen < (int)sizeof(resp) - 1 && millis() - t0 < TCP_TIMEOUT_MS) {
-        ssize_t r = esp_tls_conn_read(s_tls, resp + rlen,
-                                       sizeof(resp) - 1 - rlen);
+        int r = mbedtls_ssl_read(&cp->ssl,
+                    (unsigned char*)resp + rlen,
+                    sizeof(resp) - 1 - rlen);
         if (r > 0) {
-            rlen += (int)r;
+            rlen += r;
             resp[rlen] = '\0';
             if (strstr(resp, "\r\n\r\n")) break;
-        } else if (r == 0) {
+        } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        } else if (r != MBEDTLS_ERR_SSL_WANT_READ) {
             break;
         } else {
             delay(1);
@@ -504,10 +625,12 @@ static bool wsConnect(const char* tokenEnc)
 
     if (!strstr(resp, "101")) {
         Serial.printf("[F1Net] WS upgrade failed: %.100s\n", resp);
-        esp_tls_conn_destroy(s_tls);
-        s_tls = nullptr;
+        tls_cleanup(*cp); delete cp;
         return false;
     }
+
+    /* Persist connection for ongoing WS use */
+    s_tls = cp;
     Serial.println("[F1Net] WSS connected");
     return true;
 }
@@ -645,13 +768,13 @@ static void processMessage(const char* msg, int len)
 static void wsRead()
 {
     if (!s_tls) return;
-    if (!tls_data_available(s_tls)) return;
+    if (!tls_data_available(*s_tls)) return;
 
     /* Process frames while data keeps arriving */
     while (true) {
         /* Read 2-byte WebSocket frame header */
         uint8_t hdr2[2];
-        if (tls_read_exact(s_tls, hdr2, 2, 2000) != 2) {
+        if (tls_read_exact(*s_tls, hdr2, 2, 2000) != 2) {
             scheduleReconnect(); return;
         }
 
@@ -663,13 +786,13 @@ static void wsRead()
         /* Extended length */
         if (payLen == 126) {
             uint8_t ext[2];
-            if (tls_read_exact(s_tls, ext, 2, 500) != 2) {
+            if (tls_read_exact(*s_tls, ext, 2, 500) != 2) {
                 scheduleReconnect(); return;
             }
             payLen = ((uint64_t)ext[0] << 8) | ext[1];
         } else if (payLen == 127) {
             uint8_t ext[8];
-            if (tls_read_exact(s_tls, ext, 8, 500) != 8) {
+            if (tls_read_exact(*s_tls, ext, 8, 500) != 8) {
                 scheduleReconnect(); return;
             }
             payLen = 0;
@@ -679,7 +802,7 @@ static void wsRead()
         /* Server frames shouldn't be masked, but handle anyway */
         uint8_t mask[4] = {};
         if (masked) {
-            if (tls_read_exact(s_tls, mask, 4, 500) != 4) {
+            if (tls_read_exact(*s_tls, mask, 4, 500) != 4) {
                 scheduleReconnect(); return;
             }
         }
@@ -692,12 +815,12 @@ static void wsRead()
             while (skip > 0) {
                 size_t chunk = (skip > sizeof(discard))
                                ? sizeof(discard) : (size_t)skip;
-                int r = tls_read_exact(s_tls, discard, chunk, 5000);
+                int r = tls_read_exact(*s_tls, discard, chunk, 5000);
                 if (r <= 0) { scheduleReconnect(); return; }
                 skip -= (size_t)r;
             }
         } else if (payLen > 0) {
-            int r = tls_read_exact(s_tls, (uint8_t*)s_wsBuf,
+            int r = tls_read_exact(*s_tls, (uint8_t*)s_wsBuf,
                                     (size_t)payLen, 5000);
             if (r != (int)payLen) { scheduleReconnect(); return; }
             if (masked) {
@@ -719,7 +842,7 @@ static void wsRead()
         if (op == 0x9) {
             /* Ping – send pong */
             uint8_t pong[6] = {0x8A, 0x80, 0x00, 0x00, 0x00, 0x00};
-            tls_write_all(s_tls, pong, sizeof(pong));
+            tls_write_all(*s_tls, pong, sizeof(pong));
         }
         if (op == 0xA) {
             /* Pong – ignore */
@@ -730,7 +853,7 @@ static void wsRead()
         }
 
         /* Check if more frames are waiting */
-        if (!tls_data_available(s_tls)) break;
+        if (!tls_data_available(*s_tls)) break;
     }
 }
 
@@ -741,20 +864,11 @@ static void connectSignalR()
 {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    /* esp_tls has TLS compiled out (CONFIG_MBEDTLS_TLS_DISABLED).  Each failed
-       attempt blocks TCP for ~10 s, starving the web server.  After a couple of
-       failures give up so the UI stays responsive.  Will be removed when
-       F1NetWork moves to raw mbedtls.  */
-    if (s_connFails >= MAX_CONN_FAILS) return;
-
     /* Static: avoids 3 KB of stack. Safe – only called from single f1net task. */
     static char token[512];
     static char tokenEnc[1280];
     token[0] = '\0';
     if (!negotiate(token, sizeof(token))) {
-        s_connFails++;
-        if (s_connFails >= MAX_CONN_FAILS)
-            Serial.println("[F1Net] TLS appears broken – suspending retries");
         scheduleReconnect();
         return;
     }
@@ -762,14 +876,10 @@ static void connectSignalR()
     url_encode(token, tokenEnc, sizeof(tokenEnc));
 
     if (!wsConnect(tokenEnc)) {
-        s_connFails++;
-        if (s_connFails >= MAX_CONN_FAILS)
-            Serial.println("[F1Net] TLS appears broken – suspending retries");
         scheduleReconnect();
         return;
     }
 
-    s_connFails = 0;  /* reset on success */
     s_wsOpen    = true;
     s_connected = true;
     s_lastPing  = millis();
@@ -777,7 +887,7 @@ static void connectSignalR()
     s_reconnDelay = RECONNECT_INIT_MS;  /* reset back-off on success */
 
     /* SignalR subscribe */
-    ws_send_text(s_tls, SUBSCRIBE_MSG);
+    ws_send_text(*s_tls, SUBSCRIBE_MSG);
     Serial.println("[F1Net] Subscribed");
 }
 
@@ -806,7 +916,8 @@ void f1net_loop(void)
     if (f1sessions_fetchRequested()) {
         Serial.println("[F1Net] Sessions fetch requested – tearing down WS");
         if (s_tls) {
-            esp_tls_conn_destroy(s_tls);
+            tls_cleanup(*s_tls);
+            delete s_tls;
             s_tls = nullptr;
         }
         s_wsOpen    = false;
@@ -823,7 +934,8 @@ void f1net_loop(void)
     if (f1sessions_replayRequested()) {
         Serial.println("[F1Net] Replay fetch requested – tearing down WS");
         if (s_tls) {
-            esp_tls_conn_destroy(s_tls);
+            tls_cleanup(*s_tls);
+            delete s_tls;
             s_tls = nullptr;
         }
         s_wsOpen    = false;
@@ -838,7 +950,8 @@ void f1net_loop(void)
     if (f1cal_apiFetchRequested()) {
         Serial.println("[F1Net] Calendar API fetch requested – tearing down WS");
         if (s_tls) {
-            esp_tls_conn_destroy(s_tls);
+            tls_cleanup(*s_tls);
+            delete s_tls;
             s_tls = nullptr;
         }
         s_wsOpen    = false;
@@ -877,7 +990,7 @@ void f1net_loop(void)
 
     /* Send SignalR keepalive {} ping */
     if (millis() - s_lastPing > PING_INTERVAL_MS) {
-        ws_send_text(s_tls, "{}");
+        ws_send_text(*s_tls, "{}");
         s_lastPing = millis();
     }
 }
@@ -890,7 +1003,8 @@ void f1net_disconnect(void)
     s_wsOpen    = false;
     s_connected = false;
     if (s_tls) {
-        esp_tls_conn_destroy(s_tls);
+        tls_cleanup(*s_tls);
+        delete s_tls;
         s_tls = nullptr;
     }
 }
