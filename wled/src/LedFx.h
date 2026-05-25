@@ -10,9 +10,11 @@
  *   0 = solid        – fill both segments with primary color
  *   1 = pulse        – breathing (sine-wave brightness)
  *   2 = spinner      – rotating half-strip colored segment
- *   3 = strobe       – rapid on/off flash
- *   4 = alt_letters  – alternate F-segment and 1-segment between two colors;
- *                      phase A: F=colorA / 1=colorB, phase B: F=colorB / 1=colorA
+ *   3 = strobe          – rapid on/off flash
+ *   4 = alt_letters     – alternate F-segment and 1-segment between two colors;
+ *                         phase A: F=colorA / 1=colorB, phase B: F=colorB / 1=colorA
+ *   5 = rainbow_spin    – full-strip hue rotation (force/test only)
+ *   6 = checkered_flag  – per-pixel alternating primary/black, pattern sweeps
  *
  * LED_PIN and MAX_LEDS come from platformio.ini build_flags.
  * Actual LED count is set at runtime via ledfx_init() / ledfx_setCount().

@@ -245,13 +245,28 @@ void ledfx_tick() {
             break;
         }
 
-        /* ── 5: rainbow_spin (winner celebration) ──────────────────────── */
+        /* ── 5: rainbow_spin (kept for compatibility / force-state testing) ── */
         /* Hue cycles across the whole strip and advances over time. */
         case 5: {
             uint8_t inc = (uint8_t)((s_speed * 3UL) / 255 + 1);
             s_phase += inc;
             uint8_t delta = s_count ? (256 / s_count) : 8;
             fill_rainbow(s_leds, s_count, s_phase, delta);
+            clearExtra();
+            break;
+        }
+
+        /* ── 6: checkered_flag ───────────────────────────────────────────── */
+        /* Per-pixel alternating primary-color / black pattern that sweeps   */
+        /* back and forth to simulate a waving chequered flag.               */
+        case 6: {
+            uint8_t inc = (uint8_t)((s_speed * 5UL) / 255 + 1);
+            s_phase += inc;
+            /* offset cycles 0→1→2→3 across the full phase range */
+            uint8_t offset = (uint8_t)((s_phase * 4u) >> 8u);
+            for (uint16_t i = 0; i < s_count; i++) {
+                s_leds[i] = ((i + offset) % 4u == 0u) ? s_color : CRGB::Black;
+            }
             clearExtra();
             break;
         }

@@ -157,6 +157,7 @@ static F1NetState trackCodeToState(const char* code)
     switch (code[0]) {
         case '1': return F1ST_GREEN;
         case '2': return F1ST_YELLOW;
+        case '3': return F1ST_YELLOW;      /* Flag / yellow variant           */
         case '4': return F1ST_SAFETY_CAR;
         case '5': return F1ST_RED_FLAG;
         case '6': return F1ST_VIRTUAL_SC;
@@ -642,6 +643,59 @@ static void processMessage(const char* msg, int len)
 {
     /* Ignore keepalive {} */
     if (len <= 2) return;
+
+    /* ── Initial snapshot frame: {"R": {"TrackStatus":{...},"SessionStatus":{...}}} ── */
+    const char* rp = strstr(msg, "\"R\":");
+    if (rp) {
+        rp += 4;
+        while (*rp == ' ') ++rp;
+        if (*rp == '{') {
+            /* Extract TrackStatus.Status */
+            const char* tsp = strstr(rp, "\"TrackStatus\"");
+            if (tsp) {
+                char code[8] = {};
+                json_str(tsp, "Status", code, sizeof(code));
+                if (code[0]) {
+                    F1NetState ns = trackCodeToState(code);
+                    Serial.printf("[F1Net] Snapshot TrackStatus=%s\n", code);
+                    char evMsg[F1_EVENT_MSG_LEN];
+                    static const char* TRK_NAMES[] = {
+                        "Idle","Green","Yellow","Yellow","Safety Car",
+                        "Red Flag","VSC","VSC Ending"};
+                    int ci = code[0] - '0';
+                    const char* tn = (ci >= 0 && ci <= 7) ? TRK_NAMES[ci] : code;
+                    snprintf(evMsg, sizeof(evMsg), "Track: %s (snapshot)", tn);
+                    logEvent("Track", evMsg);
+                    applyState(ns);
+                }
+            }
+            /* Extract SessionStatus.Status */
+            const char* ssp = strstr(rp, "\"SessionStatus\"");
+            if (ssp) {
+                char status[32] = {};
+                json_str(ssp, "Status", status, sizeof(status));
+                if (status[0]) {
+                    Serial.printf("[F1Net] Snapshot SessionStatus=%s\n", status);
+                    char evMsg[F1_EVENT_MSG_LEN];
+                    snprintf(evMsg, sizeof(evMsg), "Session: %s (snapshot)", status);
+                    logEvent("Session", evMsg);
+                    if (strstr(status, "Started")) {
+                        s_sessionActive = true;
+                        s_sessEndEpoch  = 0;
+                        /* Don't fire SESSION_START from snapshot – session already running */
+                    } else if (strstr(status, "Finished") || strstr(status, "Ends")) {
+                        s_sessEndEpoch = (uint32_t)time(nullptr);
+                        applyState(F1ST_CHEQUERED);
+                    } else if (strstr(status, "Inactive")) {
+                        s_sessionActive = false;
+                        if (s_sessEndEpoch == 0)
+                            s_sessEndEpoch = (uint32_t)time(nullptr);
+                        applyState(F1ST_IDLE);
+                    }
+                }
+            }
+        }
+    }
 
     /* Look for "M" array (push messages) */
     const char* mp = strstr(msg, "\"M\":");

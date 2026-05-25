@@ -355,7 +355,6 @@ void webui_init(
     /* ── GET /api/features  →  feature-flag JSON ────────────────────────── */
     s_server.on("/api/features", HTTP_GET, [](AsyncWebServerRequest* req) {
         JsonDocument doc;
-        doc["winner"]       = g_cfg.feat_winner;
         doc["fastest_lap"]  = g_cfg.feat_fastest_lap;
         doc["drs"]          = g_cfg.feat_drs;
         doc["start_lights"] = g_cfg.feat_start_lights;
@@ -368,7 +367,6 @@ void webui_init(
     auto featHandler = new AsyncCallbackJsonWebHandler("/api/features",
         [](AsyncWebServerRequest* req, JsonVariant& json) {
             JsonObject obj = json.as<JsonObject>();
-            if (obj["winner"].is<bool>())       g_cfg.feat_winner       = obj["winner"];
             if (obj["fastest_lap"].is<bool>())  g_cfg.feat_fastest_lap  = obj["fastest_lap"];
             if (obj["drs"].is<bool>())          g_cfg.feat_drs          = obj["drs"];
             if (obj["start_lights"].is<bool>()) g_cfg.feat_start_lights = obj["start_lights"];

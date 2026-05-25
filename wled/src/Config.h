@@ -39,7 +39,6 @@ struct AppConfig {
     bool     power;           /* LED output on/off (persisted)                   */
 
     /* ── Live event feature flags (persisted, UI-togglable) ────────────── */
-    bool     feat_winner;        /* rainbow spin when chequered flag fires         */
     bool     feat_fastest_lap;   /* purple flash on fastest lap                    */
     bool     feat_drs;           /* brief white pulse when DRS zones open          */
     bool     feat_start_lights;  /* 5-red-lights countdown on session start        */

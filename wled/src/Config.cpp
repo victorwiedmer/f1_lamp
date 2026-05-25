@@ -19,7 +19,6 @@ void cfg_defaults() {
     g_cfg.f_count    = 17;    /* 17 LEDs = "F" letter, remaining 5 = "1" letter */
     g_cfg.brightness = 128;
     g_cfg.power      = true;
-    g_cfg.feat_winner       = true;
     g_cfg.feat_fastest_lap  = true;
     g_cfg.feat_drs          = false;  /* fires frequently in practice – off by default */
     g_cfg.feat_start_lights = true;
@@ -33,8 +32,8 @@ void cfg_defaults() {
 
     /* 0  F1ST_IDLE          – dim red, solid (race running / no session) */
     g_cfg.states[0] = { 0,  80,   0,   0,  50,   0,   0,   0,  0 };
-    /* 1  F1ST_SESSION_START – formation lap: F green↔yellow, 1 yellow↔green */
-    g_cfg.states[1] = { 4,   0, 180,   0,  70, 180, 150,   0,  0 };
+    /* 1  F1ST_SESSION_START – formation lap: F green↔yellow, 1 yellow↔green; reverts to IDLE after 30 s */
+    g_cfg.states[1] = { 4,   0, 180,   0,  70, 180, 150,   0, 30 };
     /* 2  F1ST_GREEN         – green strobe, auto-reverts to IDLE after 10 s */
     g_cfg.states[2] = { 3,   0, 200,   0, 180,   0,   0,   0, 10 };
     /* 3  F1ST_YELLOW        – yellow pulse */
@@ -45,8 +44,8 @@ void cfg_defaults() {
     g_cfg.states[5] = { 1, 255, 100,   0,  60,   0,   0,   0,  0 };
     /* 6  F1ST_RED_FLAG     – fast red strobe */
     g_cfg.states[6] = { 3, 220,   0,   0, 180,   0,   0,   0,  0 };
-    /* 7  F1ST_CHEQUERED    – F white / 1 off, alternating */
-    g_cfg.states[7] = { 4, 255, 255, 255, 140,   0,   0,   0,  0 };
+    /* 7  F1ST_CHEQUERED    – per-pixel checker sweep, white/black; reverts to IDLE after 30 s */
+    g_cfg.states[7] = { 6, 255, 255, 255, 120,   0,   0,   0, 30 };
     /* 8  F1ST_VSC_ENDING   – fast yellow alt_letters: "prepare to race" */
     g_cfg.states[8] = { 4, 255, 200,   0, 160,   0,   0,   0,  0 };
     /* 9  F1ST_SC_ENDING    – fast yellow alt_letters: "SC coming in" (force only, no live feed code) */
@@ -90,7 +89,6 @@ void cfg_load() {
     g_cfg.f_count    = doc["f_count"]    | 17;
     g_cfg.brightness = doc["brightness"] | 128;
     g_cfg.power             = doc["power"]             | true;
-    g_cfg.feat_winner       = doc["feat_winner"]       | true;
     g_cfg.feat_fastest_lap  = doc["feat_fastest_lap"]  | true;
     g_cfg.feat_drs          = doc["feat_drs"]          | false;
     g_cfg.feat_start_lights = doc["feat_start_lights"] | true;
@@ -128,7 +126,6 @@ void cfg_save() {
     doc["f_count"]    = g_cfg.f_count;
     doc["brightness"] = g_cfg.brightness;
     doc["power"]             = g_cfg.power;
-    doc["feat_winner"]       = g_cfg.feat_winner;
     doc["feat_fastest_lap"]  = g_cfg.feat_fastest_lap;
     doc["feat_drs"]          = g_cfg.feat_drs;
     doc["feat_start_lights"] = g_cfg.feat_start_lights;

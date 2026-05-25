@@ -2,7 +2,7 @@
 const SN=['Idle','Session Start','Green Flag','Yellow Flag','Safety Car','Virtual SC','Red Flag','Chequered','VSC Ending','SC Ending'];
 const SB=['#2a2a2a','#00c800','#00c800','#ffc800','#ffc800','#ff6400','#e10600','#f0f0f0','#ffc800','#ffc800'];
 const SF=['#aaa','#000','#000','#000','#000','#000','#fff','#000','#000','#000'];
-const EF=['Solid','Pulse','Spinner','Strobe','Alt Letters'];
+const EF=['Solid','Pulse','Spinner','Strobe','Alt Letters','Rainbow Spin','Checkered Flag'];
 
 function rgb2hex(r,g,b){return '#'+[r,g,b].map(x=>x.toString(16).padStart(2,'0')).join('');}
 function hex2rgb(h){const n=parseInt(h.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255];}

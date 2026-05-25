@@ -34,15 +34,41 @@ static constexpr uint32_t WIFI_TIMEOUT_MS = 20000;
 /* ── forced state (0xFF = no override) ──────────────────────────────────── */
 static uint8_t g_forcedSt = 0xFF;
 
-/* ── F1 state change callback (called from F1NetWork task) ──────────────── */
-static volatile F1NetState g_pendingState = F1ST_IDLE;
-static volatile bool       g_pendingValid = false;
-static volatile uint32_t   g_pendingStateMs = 0; // millis() when event was received
+/* ── F1 state change queue (written by f1net task, consumed by loop()) ─────
+ *
+ *  Using a small ring buffer instead of a single slot so rapidly-changing
+ *  states (e.g. Yellow → Green within one broadcast-delay window) are all
+ *  displayed in order rather than the later entry silently overwriting the
+ *  earlier one before it has been shown.
+ *
+ *  Capacity: 8 entries – more than enough for any realistic burst.
+ *  Thread safety: head written only by producer (f1net task),
+ *                 tail written only by consumer (loop task).
+ *                 Both are uint8_t so reads/writes are naturally atomic on
+ *                 the ESP32-C3 RISC-V core.
+ * ─────────────────────────────────────────────────────────────────────── */
+#define STATE_QUEUE_SIZE 8
+struct StateEntry {
+    F1NetState state;
+    uint32_t   tsMs;   /* millis() when the event was received  */
+};
+static volatile StateEntry g_stateQueue[STATE_QUEUE_SIZE];
+static volatile uint8_t    g_sqHead = 0;  /* producer writes here */
+static volatile uint8_t    g_sqTail = 0;  /* consumer reads here  */
+
+static inline bool sqFull()  { return (uint8_t)(g_sqHead - g_sqTail) >= STATE_QUEUE_SIZE; }
+static inline bool sqEmpty() { return g_sqHead == g_sqTail; }
 
 static void applyState(F1NetState newState) {
-    g_pendingState = newState;
-    g_pendingValid = true;
-    g_pendingStateMs = millis();
+    if (sqFull()) {
+        /* Queue full: drop the oldest entry to make room so the latest
+         * state always wins when we fall hopelessly behind.             */
+        g_sqTail = (uint8_t)(g_sqTail + 1);
+    }
+    uint8_t slot = g_sqHead % STATE_QUEUE_SIZE;
+    g_stateQueue[slot].state = newState;
+    g_stateQueue[slot].tsMs  = millis();
+    g_sqHead = (uint8_t)(g_sqHead + 1);
 }
 
 static void onF1StateChange(F1NetState newState) {
@@ -275,16 +301,25 @@ void setup() {
             g_forcedSt = s;
             if (s != 0xFF) {
                 ledfx_applyState((F1NetState)s);
+            } else {
+                /* Forced state cleared – immediately restore to current live state
+                 * so the LEDs don't get stuck at whatever the forced state showed.
+                 * g_pendingValid may be false if it was discarded while force was
+                 * active, so we drive the LEDs directly from f1net_getState(). */
+                ledfx_applyState(f1net_getState());
             }
         },
         /* onReboot */ []() { ESP.restart(); },
         /* onTestEvent  0=winner  1=fastest_lap  2=drs  3=start_lights */
         [](uint8_t ev) {
-            g_forcedSt = 0xFF;   // make sure pending system is active
+            /* Test events bypass the broadcast delay – apply immediately.
+             * Also clear any forced state so the LED engine is active.   */
+            g_forcedSt = 0xFF;
+            /* Flush any queued live events so test result is visible now. */
+            g_sqTail = g_sqHead;
             switch (ev) {
-                case 0:  // winner rainbow spin
-                    g_pendingState = F1ST_CHEQUERED;
-                    g_pendingValid = true;
+                case 0:  // chequered flag – test the new checker sweep
+                    ledfx_applyState(F1ST_CHEQUERED);
                     break;
                 case 1:  // fastest lap – purple flash
                     g_pendingFlashR  = 130;
@@ -300,9 +335,8 @@ void setup() {
                     g_pendingFlashMs = 800;
                     g_pendingFlash   = true;
                     break;
-                case 3:  // start lights sequence
-                    g_pendingState = F1ST_SESSION_START;
-                    g_pendingValid = true;
+                case 3:  // start lights sequence – bypass delay, direct apply
+                    if (g_slPhase == 0) startLightsBegin();
                     break;
             }
         }
@@ -435,23 +469,30 @@ void loop() {
         return;
     }
 
-    /* ── Apply any pending F1 state change (feature-aware dispatch, with delay) ───── */
-    if (g_pendingValid && g_forcedSt == 0xFF) {
-        uint32_t now = millis();
-        uint32_t delayMs = (uint32_t)g_cfg.delay_s * 1000UL;
-        if (now - g_pendingStateMs >= delayMs) {
-            g_pendingValid = false;
-            F1NetState st = (F1NetState)g_pendingState;
+    /* ── Apply any pending F1 state changes (feature-aware dispatch, with delay) ─
+     *
+     *  Drain the queue one entry per loop() tick.  Each entry waits for
+     *  its own timestamp + the broadcast delay before being applied, so the
+     *  relative ordering of Yellow→Green (or any burst) is always preserved.
+     * ──────────────────────────────────────────────────────────────────── */
+    if (!sqEmpty() && g_forcedSt == 0xFF) {
+        uint8_t    slot    = g_sqTail % STATE_QUEUE_SIZE;
+        F1NetState st      = g_stateQueue[slot].state;
+        uint32_t   tsMs    = g_stateQueue[slot].tsMs;
+        uint32_t   delayMs = (uint32_t)g_cfg.delay_s * 1000UL;
+        if (millis() - tsMs >= delayMs) {
+            g_sqTail = (uint8_t)(g_sqTail + 1);   /* consume */
+            Serial.printf("[F1Lamp] Applying queued state %d\n", (int)st);
             if (st == F1ST_SESSION_START && g_cfg.feat_start_lights && g_slPhase == 0) {
-                startLightsBegin();             /* start lights countdown        */
-            } else if (st == F1ST_CHEQUERED && g_cfg.feat_winner) {
-                ledfx_setEffect(5, 0, 0, 0, 200); /* effect 5 = rainbow_spin    */
+                startLightsBegin();               /* start lights countdown      */
             } else {
                 ledfx_applyState(st);
             }
         }
-    } else {
-        g_pendingValid = false;
+    } else if (!sqEmpty() && g_forcedSt != 0xFF) {
+        /* Forced state active – discard all queued live events so they don't
+         * pile up and fire in a burst the moment the forced state is cleared. */
+        g_sqTail = g_sqHead;
     }
 
     /* ── Consume pending flash events (flash effect, then auto-restore) ── */
