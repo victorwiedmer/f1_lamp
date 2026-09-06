@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>F1 Lamp</title>
-<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/common.css?v=20260906c">
 </head><body>
 <div id="header"></div>
 <div id="navBar"></div>
@@ -12,33 +12,24 @@
 <div class="card">
   <h2>Track Status</h2>
   <div class="state-box" id="stateBox">Loading…</div>
-  <div class="info-row"><span>Network</span><span id="wifiInfo">Loading…</span></div>
-  <div class="info-row"><span>IP</span><span id="ipInfo" style="font-family:monospace;font-size:.8rem">—</span></div>
-  <div class="info-row"><span>Signal</span><span id="rssiInfo">—</span></div>
   <div class="info-row"><span>F1 LiveTiming</span><span style="display:flex;align-items:center;gap:8px"><span id="f1Ok">—</span><button id="f1ReconnBtn" onclick="f1Reconnect()" style="display:none;font-size:.7rem;padding:2px 8px;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;cursor:pointer">Reconnect</button></span></div>
   <div class="info-row" id="raceRow" style="display:none"><span>Race Week</span><span id="raceLabel" style="color:#ffc800">—</span></div>
   <div class="info-row" id="rampRow" style="display:none"><span>Idle ramp</span><span id="rampPct">—</span></div>
-  <div class="info-row"><span>Free heap</span><span id="heapInfo" style="font-size:.8rem">—</span></div>
-  <div id="effDetail" style="margin-top:10px;padding:10px;background:#222;border-radius:8px;display:none">
-    <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:6px">Current Effect</div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <span id="effName" style="font-size:.85rem;font-weight:700;color:#ccc"></span>
+  <div id="effDetail" onclick="location.href='/effects.html'" role="button" title="Open the Effects page"
+       style="margin-top:10px;padding:10px;background:#222;border-radius:8px;display:none;cursor:pointer">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555">Current Effect</div>
+      <span style="font-size:.62rem;color:#00d2be">Edit &#8250;</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+      <span id="effName" style="font-size:.9rem;font-weight:700;color:#ccc"></span>
       <div style="display:flex;gap:3px;align-items:center">
-        <div id="effSwatch" style="width:22px;height:22px;border-radius:4px;border:1px solid #444"></div>
-        <div id="effSwatch2" style="width:22px;height:22px;border-radius:4px;border:1px solid #444;display:none"></div>
+        <div id="effSwatch" style="width:30px;height:22px;border-radius:4px;border:1px solid #444"></div>
+        <div id="effSwatch2" style="width:30px;height:22px;border-radius:4px;border:1px solid #444;display:none"></div>
       </div>
-      <span id="effSpd" style="font-size:.72rem;color:#666"></span>
       <span id="effTag" style="font-size:.65rem;padding:2px 6px;border-radius:10px;display:none"></span>
     </div>
-    <div id="effHex" style="font-size:.68rem;color:#555;margin-top:5px;font-family:monospace"></div>
   </div>
-</div>
-
-<!-- force state -->
-<div class="card">
-  <h2>Force State (testing)</h2>
-  <div class="btn-grid" id="forceGrid"></div>
-  <button class="btn btn-outline btn-sm" onclick="forceState(255)">Clear Force</button>
 </div>
 
 <!-- brightness -->
@@ -72,7 +63,7 @@
   <div id="evEmpty" style="color:#555;font-size:.85rem;display:none">No events yet</div>
 </div>
 
-<script src="/common.js"></script>
+<script src="/common.js?v=20260906c"></script>
 <script>
 buildHeader();
 buildNav('home');
@@ -83,7 +74,6 @@ function onBri(v){
   clearTimeout(briTimer);
   briTimer=setTimeout(()=>fetch('/api/bri?v='+v,{method:'POST'}),200);
 }
-async function forceState(s){await fetch('/api/force?s='+s,{method:'POST'});}
 async function f1Reconnect(){
   const btn=document.getElementById('f1ReconnBtn');
   btn.disabled=true; btn.textContent='…';
@@ -97,10 +87,6 @@ function onStatus(d){
   const sb=document.getElementById('stateBox');
   sb.textContent=SN[idx]||'Unknown';
   sb.style.background=b; sb.style.color=f;
-  document.getElementById('wifiInfo').textContent=d.ssid||(d.ap?'AP: F1-Lamp':'—');
-  document.getElementById('ipInfo').textContent=d.ip||'—';
-  const rssiEl=document.getElementById('rssiInfo');
-  if(d.rssi){const rs=d.rssi;const col=rs>-60?'#00d2be':rs>-75?'#ffc800':'#e10600';rssiEl.textContent=rs+' dBm';rssiEl.style.color=col;}else{rssiEl.textContent=d.ap?'AP mode':'—';}
   if(d.f1ok && d.sessionActive){
     document.getElementById('f1Ok').textContent='● Live Session';
     document.getElementById('f1Ok').style.color='#00c800';
@@ -132,7 +118,6 @@ function onStatus(d){
   const hasRamp=d.rampPct>0&&d.rampPct<100;
   document.getElementById('rampRow').style.display=hasRamp?'flex':'none';
   document.getElementById('rampPct').textContent=hasRamp?(d.rampPct+'%'):'';
-  document.getElementById('heapInfo').textContent=(d.heap/1024).toFixed(1)+' KB';
   /* update session-active flag and re-render session list only when it changes */
   const _prevActive = _sessionActive;
   _sessionActive = !!d.sessionActive;
@@ -141,38 +126,21 @@ function onStatus(d){
   const ep=document.getElementById('effDetail');
   if(d.eff){
     ep.style.display='block';
-    const EN=['Solid','Pulse','Spinner','Strobe','Alt Letters','Rainbow Spin'];
-    document.getElementById('effName').textContent=EN[d.eff.e]||('Effect '+d.eff.e);
-    const c1=rgb2hex(d.eff.r,d.eff.g,d.eff.b);
-    document.getElementById('effSwatch').style.background=c1;
+    /* Label with the state ACTUALLY shown on the LEDs ("shown" = last
+       applied, i.e. after the configured event delay), falling back to the
+       live state.  Not the LED engine effect type (Solid/Pulse/...). */
+    const shownSt=(typeof d.shown==='number')?d.shown:d.state;
+    const stIdx=Math.min(shownSt,SN.length-1);
+    document.getElementById('effName').textContent=SN[stIdx]||('State '+shownSt);
+    document.getElementById('effSwatch').style.background=rgb2hex(d.eff.r,d.eff.g,d.eff.b);
     const s2=document.getElementById('effSwatch2');
-    if(d.eff.e===4){s2.style.display='inline-block';s2.style.background=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2);}else{s2.style.display='none';}
-    document.getElementById('effSpd').textContent='Speed: '+d.eff.spd;
-    const tag=document.getElementById('effTag');
-    if(d.eff.fl){tag.style.display='inline';tag.textContent='\u26a1 Flash';tag.style.background='#3a2a00';tag.style.color='#ffc800';}
-    else if(d.eff.rp){tag.style.display='inline';tag.textContent='\u25b6 Replay';tag.style.background='#1a3a1a';tag.style.color='#6f6';}
-    else{tag.style.display='none';}
-    let hexTxt='Color: '+c1.toUpperCase()+' ('+d.eff.r+','+d.eff.g+','+d.eff.b+')';
-    if(d.eff.e===4){const c2=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2).toUpperCase();hexTxt+='  /  '+c2+' ('+d.eff.r2+','+d.eff.g2+','+d.eff.b2+')';}
-    document.getElementById('effHex').textContent=hexTxt;
+    if(d.eff.e===4){
+      s2.style.display='inline-block';
+      s2.style.background=rgb2hex(d.eff.r2,d.eff.g2,d.eff.b2);
+    }else{s2.style.display='none';}
   }else{ep.style.display='none';}
 }
 
-/* force state grid */
-(function(){
-  const g=document.getElementById('forceGrid');
-  SN.forEach((n,i)=>{
-    const b=document.createElement('button');
-    b.className='btn btn-sm';b.textContent=n;
-    b.style.background=SB[i];b.style.color=SF[i];
-    b.onclick=()=>forceState(i);
-    g.appendChild(b);
-  });
-  setTimeout(()=>pollStatus(onStatus),300);
-  setInterval(()=>pollStatus(onStatus),2000);
-  /* Fetch next race schedule */
-  loadNextRace();
-})();
 
 /* ── Next Race Weekend ──────────────────────────────────────────────── */
 let _nrData = null;
@@ -402,5 +370,12 @@ function startEventPoll(){
   evTimer=setInterval(loadEvents,5000);
 }
 startEventPoll();
+
+/* Startup: poll status (state box, F1 link, race week, effect) and load the
+   next-race weekend schedule (kept when the Force State section moved to
+   Extras). */
+setTimeout(()=>pollStatus(onStatus),300);
+setInterval(()=>pollStatus(onStatus),2000);
+loadNextRace();
 </script>
 </body></html>

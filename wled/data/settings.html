@@ -3,16 +3,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>F1 Lamp – Settings</title>
-<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/common.css?v=20260906c">
 </head><body>
 <div id="header"></div>
 <div id="navBar"></div>
 
-<!-- WiFi shortcut -->
+<!-- WiFi -->
 <div class="card">
   <h2>WiFi</h2>
-  <div class="info-row"><span>SSID</span><span id="curSsid">—</span></div>
+  <div class="info-row"><span>Network</span><span id="curSsid">—</span></div>
+  <div class="info-row"><span>Mode</span><span id="curMode">—</span></div>
   <div class="info-row"><span>IP</span><span id="curIp" style="font-family:monospace">—</span></div>
+  <div class="info-row"><span>Signal</span><span id="curSig">—</span></div>
+  <div class="info-row"><span>mDNS</span><span style="font-family:monospace">f1lamp.local</span></div>
   <div style="margin-top:8px"><a href="/wifi.html" class="btn btn-sm btn-outline">Configure WiFi</a></div>
 </div>
 
@@ -84,7 +87,7 @@
   </div>
 </div>
 
-<script src="/common.js"></script>
+<script src="/common.js?v=20260906c"></script>
 <script>
 buildHeader();
 buildNav('settings');
@@ -182,7 +185,12 @@ async function uploadFirmware(){
 
 function onStatus(d){
   document.getElementById('curSsid').textContent=d.ssid||'(none)';
+  document.getElementById('curMode').textContent=d.ap?'Access Point (F1-Lamp)':'Station ('+(d.ssid||'no network')+')';
   document.getElementById('curIp').textContent=d.ip||'—';
+  const sig=document.getElementById('curSig');
+  if(d.rssi){const c=d.rssi>-60?'#00d2be':d.rssi>-75?'#ffc800':'#e10600';
+    sig.textContent=d.rssi+' dBm';sig.style.color=c;
+  }else{sig.textContent='—';sig.style.color='#888';}
   if(d.nextRace) document.getElementById('nextRace').textContent=d.nextRace;
 }
 

@@ -70,6 +70,11 @@ struct LedFxInfo {
 /* Retrieve current effect parameters (thread-safe snapshot). */
 LedFxInfo ledfx_getActiveEffect();
 
+/* F1 state currently shown on the LEDs (what ledfx_applyState last set).
+   Distinct from f1net_getState(), which is the just-received live state that
+   may still be waiting out the configured event delay. */
+F1NetState ledfx_getAppliedState();
+
 /* Directly set the strip to show N of 5 "start lights" (red).
    phase 0 = all off, phase 1–5 = progressively more LEDs lit.
    Calls FastLED.show() immediately (bypasses tick). */

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>F1 Lamp – Extras</title>
+<link rel="stylesheet" href="/common.css?v=20260906c">
+</head><body>
+<div id="header"></div>
+<div id="navBar"></div>
+
+<!-- force state (testing) -->
+<div class="card">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <h2 style="margin:0">Force State <span style="font-size:.6rem;color:#555;font-weight:400">(testing)</span></h2>
+    <button class="btn btn-outline btn-sm" onclick="forceState(255)">Clear Force</button>
+  </div>
+  <div style="font-size:.72rem;color:#555;margin-bottom:8px">Temporarily show a state on the LEDs (bypasses the live feed and the event delay).</div>
+  <div class="btn-grid" id="forceGrid"></div>
+</div>
+
+<!-- quick test events -->
+<div class="card">
+  <div style="font-weight:700;font-size:.85rem;margin-bottom:8px">Quick Test Events</div>
+  <div style="display:flex;flex-wrap:wrap;gap:5px">
+    <button class="btn btn-sm" style="background:#2a2a2a;color:#f0f0f0;border:1px solid #666" onclick="testEvent(0)">&#9873; Chequered</button>
+    <button class="btn btn-sm" style="background:#2a1a3a;color:#c080ff;border:1px solid #7040a0" onclick="testEvent(1)">&#128156; Fastest Lap</button>
+    <button class="btn btn-sm" style="background:#2a2a2a;color:#ccc;border:1px solid #555" onclick="testEvent(2)">&#9989; DRS Open</button>
+    <button class="btn btn-sm" style="background:#3a0a0a;color:#ff8080;border:1px solid #e10600" onclick="testEvent(3)">&#128308; Start Lights</button>
+  </div>
+</div>
+
+<!-- device info (network details live in Settings > WiFi) -->
+<div class="card">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <h2 style="margin:0">Device</h2>
+    <a href="/settings.html" style="font-size:.68rem;color:#00d2be;text-decoration:none">Network info &#8250; Settings</a>
+  </div>
+  <div class="info-row"><span>Free heap</span><span id="xHeap" style="font-size:.8rem">—</span></div>
+  <div class="row" style="margin-top:10px;gap:8px">
+    <button class="btn btn-sm btn-outline" onclick="f1Reconnect()" id="xReconn">Reconnect F1</button>
+  </div>
+</div>
+
+<script src="/common.js?v=20260906c"></script>
+<script>
+buildHeader();
+buildNav('extras');
+
+async function forceState(s){await fetch('/api/force?s='+s,{method:'POST'});}
+async function testEvent(ev){await fetch('/api/test_event?ev='+ev,{method:'POST'});}
+async function f1Reconnect(){
+  const b=document.getElementById('xReconn');
+  b.disabled=true;b.textContent='…';
+  await fetch('/api/f1reconnect');
+  setTimeout(()=>{b.disabled=false;b.textContent='Reconnect F1';},3000);
+}
+function reboot(){
+  if(!confirm('Reboot the F1 Lamp?'))return;
+  fetch('/api/reboot',{method:'POST'});
+}
+
+/* force-state grid */
+(function(){
+  const g=document.getElementById('forceGrid');
+  SN.forEach((n,i)=>{
+    const b=document.createElement('button');
+    b.className='btn btn-sm';
+    b.textContent=n;
+    b.style.background=SB[i];b.style.color=SF[i];
+    b.onclick=()=>forceState(i);
+    g.appendChild(b);
+  });
+})();
+
+function onStatus(d){
+  document.getElementById('xHeap').textContent=(d.heap/1024).toFixed(1)+' KB';
+}
+
+setTimeout(()=>pollStatus(onStatus),300);
+setInterval(()=>pollStatus(onStatus),4000);
+</script>
+</body></html>

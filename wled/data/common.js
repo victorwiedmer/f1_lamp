@@ -20,6 +20,7 @@ function buildNav(active){
     {id:'home',href:'/',label:'&#9873; Status'},
     {id:'effects',href:'/effects.html',label:'&#127912; Effects'},
     {id:'features',href:'/features.html',label:'&#9889; Features'},
+    {id:'extras',href:'/extras.html',label:'&#128295; Extras'},
     {id:'sessions',href:'/sessions.html',label:'&#127760; Sessions'},
     {id:'settings',href:'/settings.html',label:'&#9881; Settings'},
   ];

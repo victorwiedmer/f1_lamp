@@ -221,6 +221,7 @@ void webui_init(
     s_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req) {
         JsonDocument doc;
         doc["state"]         = (int)f1net_getState();
+        doc["shown"]         = (int)ledfx_getAppliedState();
         doc["connected"]     = f1net_isConnected();
         doc["sessionActive"] = f1net_sessionActive();
         doc["ssid"]          = g_cfg.ssid;

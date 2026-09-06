@@ -28,6 +28,7 @@ static uint8_t s_speed   = 50;
 /* ── auto-revert timer ────────────────────────────────────────────────────── */
 static uint32_t   s_revertAt    = 0;            /* millis() target, 0=none  */
 static F1NetState s_revertState = F1ST_IDLE;
+static F1NetState s_appliedState = F1ST_IDLE;  /* state currently shown on the LEDs */
 
 /* ── animation state ─────────────────────────────────────────────────────── */
 static uint32_t s_lastMs  = 0;
@@ -63,6 +64,7 @@ void ledfx_init(uint16_t count, uint16_t f_count, uint8_t brightness) {
 }
 
 void ledfx_applyState(F1NetState state) {
+    s_appliedState = state;   /* record what is actually on the LEDs */
     int idx = (int)state;
     if (idx < 0 || idx >= CFG_NUM_STATES) idx = 0;
     const StateEffect& se = g_cfg.states[idx];
@@ -111,6 +113,10 @@ LedFxInfo ledfx_getActiveEffect() {
     info.speed    = s_speed;
     info.flashing = (s_flashEndMs != 0 && millis() < s_flashEndMs);
     return info;
+}
+
+F1NetState ledfx_getAppliedState() {
+    return s_appliedState;
 }
 
 void ledfx_setCount(uint16_t count) {
