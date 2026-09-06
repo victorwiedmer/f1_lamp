@@ -24,6 +24,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
+#include <cctype>
 #include <ctime>
 #include <Arduino.h>        /* millis(), Serial                        */
 
@@ -47,32 +49,45 @@
 #include "F1Sessions.h"
 #include "F1Calendar.h"
 #include "F1StringUtils.h"  /* f1_url_encode, f1_json_str */
+#include "F1TimeUtils.h"    /* f1_clock() – clean 32-bit wall clock */
+#include "Config.h"         /* g_cfg.react_* – which events the LED reacts to */
 
 /* ----------------------------------------------------------------
    Tunables
    ---------------------------------------------------------------- */
 static constexpr uint32_t RECONNECT_INIT_MS  =   5000;
-static constexpr uint32_t RECONNECT_MAX_MS   = 120000;
+static constexpr uint32_t RECONNECT_MAX_MS   =  30000;
 /* Server KeepAliveTimeout = 20 s (from /signalr/negotiate).
    Send our ping every 15 s so we stay within that window.
-   Only declare idle after 45 s – well beyond one server heartbeat cycle. */
+   Declare idle after 30 s (1.5× server timeout) – faster failover. */
 static constexpr uint32_t PING_INTERVAL_MS   =  15000;   /* SignalR {} ping  */
 static constexpr uint32_t TCP_TIMEOUT_MS     =  10000;   /* connect timeout  */
-static constexpr uint32_t READ_TIMEOUT_MS    =  45000;   /* idle WS timeout  */
+static constexpr uint32_t READ_TIMEOUT_MS    =  30000;   /* idle WS timeout  */
 
 /* ----------------------------------------------------------------
    SignalR endpoints (HTTPS, port 443)
    ---------------------------------------------------------------- */
 static constexpr const char* SR_HOST      = "livetiming.formula1.com";
 static constexpr int         SR_PORT      = 443;
-static constexpr const char* SR_NEGOTIATE = "/signalr/negotiate";
-static constexpr const char* SR_CONNECT   = "/signalr/connect";
-static constexpr const char* HUB_DATA_ENC =
-    "%5B%7B%22name%22%3A%22Streaming%22%7D%5D";
+/* SignalR Core (/signalrcore/) replaced classic SignalR (/signalr/) in 2026.
+   Classic endpoint now returns 401.  Core endpoint is open (no auth needed).
+   Protocol differences:
+     - Negotiate: POST /signalrcore/negotiate?negotiateVersion=1
+     - WS URL: /signalrcore?id=<connectionToken>
+     - After WS upgrade: send handshake {"protocol":"json","version":1}\x1e
+     - Subscribe: {"type":1,...}\x1e
+     - Snapshot: type:3 with "result" field (same structure as old "R" field)
+     - Push: type:1 with "target":"feed"
+     - Ping: {"type":6}\x1e
+     - All messages terminated with \x1e (0x1E record separator) */
+static constexpr const char* SR_NEGOTIATE = "/signalrcore/negotiate";
+static constexpr const char* SR_CONNECT   = "/signalrcore";
+static constexpr const char* HANDSHAKE_MSG =
+    "{\"protocol\":\"json\",\"version\":1}\x1e";
 static constexpr const char* SUBSCRIBE_MSG =
-    "{\"H\":\"Streaming\",\"M\":\"Subscribe\","
-    "\"A\":[[\"TrackStatus\",\"SessionStatus\",\"Heartbeat\",\"RaceControlMessages\"]],"
-    "\"I\":1}";
+    "{\"type\":1,\"invocationId\":\"0\",\"target\":\"Subscribe\","
+    "\"arguments\":[[\"TrackStatus\",\"SessionStatus\",\"Heartbeat\",\"RaceControlMessages\"]]}"
+    "\x1e";
 
 /* ----------------------------------------------------------------
    Module state
@@ -81,6 +96,7 @@ static volatile F1NetState  s_state       = F1ST_IDLE;
 static volatile bool        s_connected   = false;
 static F1NetStateCB         s_callback    = nullptr;
 static F1EventCB            s_eventCallback = nullptr;
+static F1SnapshotCB         s_snapshotCb   = nullptr;
 
 /* ----------------------------------------------------------------
    TlsConn – mbedTLS + raw lwIP socket (same struct as F1Sessions.cpp)
@@ -101,6 +117,20 @@ static unsigned long s_lastConnect = 0;
 static unsigned long s_lastPing    = 0;
 static unsigned long s_lastData    = 0;  /* last ws frame received */
 static bool        s_sessionActive = false;
+static const char* s_connectPhase  = "wait";  /* human-readable phase */
+static char        s_lastErr[128]  = {};      /* last connect failure reason */
+static bool        s_handshakeAcked = false;  /* server confirmed {}\x1e ack */
+static bool        s_handshakeErr   = false;  /* server rejected handshake   */
+
+/* Record the most recent connection failure reason (for /api/status + logs) */
+static void setErr(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_lastErr, sizeof(s_lastErr), fmt, ap);
+    va_end(ap);
+    Serial.printf("[F1Net] ERR: %s\n", s_lastErr);
+}
 
 /* ── Live event ring buffer ──────────────────────────────────────────── */
 static F1LiveEvent s_eventLog[F1_EVENT_LOG_MAX];
@@ -111,8 +141,8 @@ static uint32_t    s_sessEndEpoch = 0; /* epoch when session ended (0=active) */
 static void logEvent(const char* category, const char* message) {
     /* Auto-clear if >1h past session end */
     if (s_sessEndEpoch > 0) {
-        time_t now = time(nullptr);
-        if (now > (time_t)s_sessEndEpoch + 3600) {
+        long now = (long)f1_clock();
+        if (now > (long)s_sessEndEpoch + 3600L) {
             s_evCount = 0;
             s_evHead  = 0;
             s_sessEndEpoch = 0;
@@ -132,7 +162,10 @@ static char s_cookies[512] = {};
 
 /* WS frame reassembly */
 static char s_wsBuf[4096];
-static int  s_wsBufLen = 0;
+
+/* Diagnostics: last frame opcode seen + frame counter (for drop forensics) */
+static uint8_t  s_lastOp     = 0xFF;
+static uint32_t s_frameCount = 0;
 
 /* ----------------------------------------------------------------
    Helpers
@@ -148,6 +181,59 @@ static bool json_str(const char* json, const char* key,
                      char* out, size_t out_size)
 {
     return f1_json_str(json, key, out, out_size);
+}
+
+/* Case-insensitive substring test (avoids strcasestr availability issues) */
+static bool f1_contains_ci(const char* hay, const char* needle)
+{
+    if (!hay || !needle || !needle[0]) return false;
+    size_t nl = strlen(needle);
+    for (const char* p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < nl && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+/* Decide which LED state a RaceControl message drives, honouring the
+   user's g_cfg.react_* switches.  Returns F1ST_UNKNOWN when the message
+   should not change the LED.  Green/clear is deliberately left to the
+   TrackStatus code 1, because RC "TRACK CLEAR"-style notes proved
+   ambiguous in the live feed. */
+static F1NetState rcEventToState(const char* cat, const char* flag,
+                                 const char* scope, const char* text)
+{
+    if (!g_cfg.react_global && !g_cfg.react_sector) return F1ST_UNKNOWN;
+
+    /* Global announcements (these are what the TV mirrors) */
+    if (g_cfg.react_global && text && text[0]) {
+        if (f1_contains_ci(text, "RED FLAG"))     return F1ST_RED_FLAG;
+        if (f1_contains_ci(text, "VIRTUAL SAFETY CAR")
+                || f1_contains_ci(text, "VSC"))
+            return F1ST_VIRTUAL_SC;
+        if (f1_contains_ci(text, "SAFETY CAR"))   return F1ST_SAFETY_CAR;
+        if (f1_contains_ci(text, "CHEQUERED"))    return F1ST_CHEQUERED;
+    }
+
+    bool isFlag = (cat && cat[0] && strcasecmp(cat, "Flag") == 0);
+    if (!isFlag) return F1ST_UNKNOWN;
+
+    bool isSector = (scope && strcasecmp(scope, "Sector") == 0);
+    if (isSector) {
+        /* Sector-local yellows only when the user opted in */
+        if (g_cfg.react_sector && flag && f1_contains_ci(flag, "YELLOW"))
+            return F1ST_YELLOW;
+        return F1ST_UNKNOWN;
+    }
+    /* Track-scope flags */
+    if (g_cfg.react_global) {
+        if (flag && f1_contains_ci(flag, "RED"))    return F1ST_RED_FLAG;
+        if (flag && f1_contains_ci(flag, "YELLOW")) return F1ST_YELLOW;
+    }
+    return F1ST_UNKNOWN;
 }
 
 /* Map TrackStatus code → F1NetState */
@@ -179,8 +265,13 @@ static void applyState(F1NetState ns)
 static void tls_cleanup(TlsConn& c);
 
 /* Schedule reconnect with back-off */
-static void scheduleReconnect()
+static void scheduleReconnect(const char* reason = "unknown")
 {
+    Serial.printf("[F1Net] scheduleReconnect reason=%s t=%lu lastOp=%u "
+                  "frames=%lu dataAge=%lums\n",
+                  reason, (unsigned long)millis(),
+                  (unsigned)s_lastOp, (unsigned long)s_frameCount,
+                  s_lastData ? (unsigned long)(millis() - s_lastData) : 0UL);
     s_wsOpen     = false;
     s_connected  = false;
     if (s_tls) {
@@ -189,10 +280,10 @@ static void scheduleReconnect()
         s_tls = nullptr;
     }
     s_lastConnect = millis();
-    Serial.printf("[F1Net] Reconnect in %ums\n", s_reconnDelay);
     if (s_reconnDelay < RECONNECT_MAX_MS)
         s_reconnDelay = (s_reconnDelay < RECONNECT_MAX_MS / 2)
                         ? s_reconnDelay * 2 : RECONNECT_MAX_MS;
+    Serial.printf("[F1Net] Reconnect in %ums\n", s_reconnDelay);
 }
 
 /* ----------------------------------------------------------------
@@ -239,6 +330,8 @@ static bool tls_connect(TlsConn& c)
     char errbuf[128];
     c.sock = -1;
     c.connected = false;
+    Serial.printf("[F1Net] tls_connect() %s:%d heap=%u\n",
+                  SR_HOST, SR_PORT, (unsigned)esp_get_free_heap_size());
 
     mbedtls_ssl_init(&c.ssl);
     mbedtls_ssl_config_init(&c.conf);
@@ -284,7 +377,7 @@ static bool tls_connect(TlsConn& c)
     snprintf(portStr, sizeof(portStr), "%d", SR_PORT);
     ret = lwip_getaddrinfo(SR_HOST, portStr, &hints, &res);
     if (ret != 0 || !res) {
-        Serial.printf("[F1Net] DNS failed: %d\n", ret);
+        setErr("DNS failed for %s: %d", SR_HOST, ret);
         tls_cleanup(c); return false;
     }
     {
@@ -306,13 +399,15 @@ static bool tls_connect(TlsConn& c)
         lwip_setsockopt(c.sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         if (lwip_connect(c.sock, res->ai_addr, res->ai_addrlen) == 0) {
             tcpOk = true;
+            Serial.printf("[F1Net] TCP connect OK (fd=%d)\n", c.sock);
         } else {
+            setErr("TCP connect failed: %d", errno);
             lwip_close(c.sock); c.sock = -1;
         }
     }
     lwip_freeaddrinfo(res);
     if (!tcpOk) {
-        Serial.println("[F1Net] TCP connect failed");
+        setErr("TCP connect failed after retries");
         tls_cleanup(c); return false;
     }
 
@@ -332,7 +427,10 @@ static bool tls_connect(TlsConn& c)
         delay(1);
     }
     c.connected = true;
-    Serial.println("[F1Net] TLS handshake OK");
+    Serial.printf("[F1Net] TLS handshake OK  ver=%s cipher=%s\n",
+                  mbedtls_ssl_get_version(&c.ssl),
+                  mbedtls_ssl_get_ciphersuite(&c.ssl));
+    s_lastErr[0] = '\0';   /* clear last error on success */
     return true;
 }
 
@@ -356,20 +454,56 @@ static bool tls_write_all(TlsConn& c, const void* data, size_t len)
     return sent == len;
 }
 
-/* Check if socket has data available without blocking */
-static bool tls_data_available(TlsConn& c)
+/* Put the socket in non-blocking mode so mbedtls_ssl_read() returns
+ * MBEDTLS_ERR_SSL_WANT_READ immediately when no data has arrived.  We
+ * deliberately avoid select()/ioctl(FIONREAD) readiness checks: the
+ * descriptors here are large (fd ~ 48) and lwIP's fd_set is small, so
+ * those checks never report readability on this build. */
+static void tls_set_nonblocking(TlsConn& c)
 {
-    if (c.sock < 0) return false;
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(c.sock, &fds);
-    struct timeval tv = {0, 0};
-    return select(c.sock + 1, &fds, nullptr, nullptr, &tv) > 0;
+    if (c.sock < 0) return;
+    int fl = lwip_fcntl(c.sock, F_GETFL, 0);
+    if (fl >= 0) lwip_fcntl(c.sock, F_SETFL, fl | O_NONBLOCK);
 }
 
-/* Read exactly 'len' bytes with timeout */
+/* Read exactly 'want' bytes from the TLS stream.
+ *
+ * Returns:
+ *    1  - success (all 'want' bytes read)
+ *    0  - would block with NO bytes read yet (soft; caller retries later;
+ *         only legal when allowSoft is true, i.e. before the first byte
+ *         of a WS frame has been consumed)
+ *   -1  - fatal: peer closed / TLS error / mid-frame stall longer than
+ *         stall_ms with allowSoft=false
+ */
+static int wsReadFull(TlsConn& c, uint8_t* buf, size_t want,
+                      uint32_t stall_ms, bool allowSoft)
+{
+    size_t got = 0;
+    unsigned long t0 = millis();
+    while (got < want) {
+        int r = mbedtls_ssl_read(&c.ssl, buf + got, want - got);
+        if (r > 0) {
+            got += (size_t)r;
+            t0 = millis();            /* reset stall timer on progress */
+            continue;
+        }
+        if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return -1;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (got == 0 && allowSoft) return 0;   /* nothing yet - retry later */
+            if ((int32_t)(millis() - t0) > (int32_t)stall_ms) return -1;
+            delay(1);
+            continue;
+        }
+        return -1;                    /* real TLS error */
+    }
+    return 1;
+}
+
+/* Read exactly 'len' bytes with timeout (used by the HTTP negotiate path,
+   which expects a full body).  Returns got bytes or -1 on error/timeout. */
 static int tls_read_exact(TlsConn& c, uint8_t* buf, size_t len,
-                           uint32_t timeout_ms)
+                          uint32_t timeout_ms)
 {
     size_t got = 0;
     unsigned long t0 = millis();
@@ -425,8 +559,9 @@ static void extractCookies(const char* headers, char* out, size_t outLen)
    WebSocket framing (RFC 6455, client-side only, no fragmentation)
    ---------------------------------------------------------------- */
 
-/* Send a text frame from client (mask bit set, 4-byte mask) */
-static void ws_send_text(TlsConn& c, const char* payload)
+/* Send a text frame from client (mask bit set, 4-byte mask).
+   Returns true when the entire frame reached the TLS stream. */
+static bool ws_send_text(TlsConn& c, const char* payload)
 {
     size_t len = strlen(payload);
     uint8_t hdr[14];
@@ -449,7 +584,7 @@ static void ws_send_text(TlsConn& c, const char* payload)
     memcpy(hdr + hdrLen, mask, 4);
     hdrLen += 4;
 
-    tls_write_all(c, hdr, hdrLen);
+    if (!tls_write_all(c, hdr, hdrLen)) return false;
 
     /* Write masked payload */
     char masked[256];
@@ -458,24 +593,17 @@ static void ws_send_text(TlsConn& c, const char* payload)
     size_t mi = 0;
     while (remaining > 0) {
         size_t chunk = (remaining > sizeof(masked)) ? sizeof(masked) : remaining;
-        for (size_t i = 0; i < chunk; ++i) {
+        for (size_t i = 0; i < chunk; ++i)
             masked[i] = p[i] ^ mask[mi++ & 3];
-        }
-        tls_write_all(c, masked, chunk);
+        if (!tls_write_all(c, masked, chunk)) return false;
         p += chunk;
         remaining -= chunk;
     }
-}
-
-/* Send WS ping frame */
-static void ws_send_ping(TlsConn& c)
-{
-    uint8_t frame[6] = {0x89, 0x80, 0x00, 0x00, 0x00, 0x00};  /* FIN+ping, masked, len=0 */
-    tls_write_all(c, frame, sizeof(frame));
+    return true;
 }
 
 /* ----------------------------------------------------------------
-   HTTPS negotiate  (captures ALB cookies for WebSocket upgrade)
+   HTTPS negotiate  (SignalR Core: POST, captures ALB cookie)
    ---------------------------------------------------------------- */
 static bool negotiate(char* outToken, size_t tokenLen)
 {
@@ -488,15 +616,17 @@ static bool negotiate(char* outToken, size_t tokenLen)
         return false;
     }
 
+    /* SignalR Core negotiate: POST with empty body */
     static char req[512];
     snprintf(req, sizeof(req),
-        "GET %s?clientProtocol=1.5&connectionData=%s HTTP/1.1\r\n"
+        "POST %s?negotiateVersion=1 HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: BestHTTP\r\n"
+        "Content-Length: 0\r\n"
         "Accept-Encoding: identity\r\n"
         "Connection: close\r\n"
         "\r\n",
-        SR_NEGOTIATE, HUB_DATA_ENC, SR_HOST);
+        SR_NEGOTIATE, SR_HOST);
 
     if (!tls_write_all(*cp, req, strlen(req))) {
         Serial.println("[F1Net] Neg write fail");
@@ -528,7 +658,7 @@ static bool negotiate(char* outToken, size_t tokenLen)
     /* Parse status line */
     int statusCode = 0;
     if (sscanf(resp, "HTTP/1.1 %d", &statusCode) != 1 || statusCode != 200) {
-        Serial.printf("[F1Net] Neg HTTP %d\n", statusCode);
+        setErr("Neg HTTP %d: %.80s", statusCode, resp);
         return false;
     }
 
@@ -540,8 +670,9 @@ static bool negotiate(char* outToken, size_t tokenLen)
     if (!body) { Serial.println("[F1Net] No body"); return false; }
     body += 4;
 
-    if (!json_str(body, "ConnectionToken", outToken, tokenLen)) {
-        Serial.println("[F1Net] No ConnectionToken");
+    /* SignalR Core uses lowercase "connectionToken" */
+    if (!json_str(body, "connectionToken", outToken, tokenLen)) {
+        Serial.println("[F1Net] No connectionToken");
         return false;
     }
     Serial.printf("[F1Net] Token len=%d\n", (int)strlen(outToken));
@@ -549,9 +680,9 @@ static bool negotiate(char* outToken, size_t tokenLen)
 }
 
 /* ----------------------------------------------------------------
-   WebSocket connect + upgrade  (WSS, forwarding ALB cookies)
+   WebSocket connect + upgrade  (SignalR Core: /signalrcore?id=<token>)
    ---------------------------------------------------------------- */
-static bool wsConnect(const char* tokenEnc)
+static bool wsConnect(const char* token)
 {
     TlsConn* cp = new (std::nothrow) TlsConn;
     if (!cp) { Serial.println("[F1Net] OOM wsConnect"); return false; }
@@ -562,15 +693,13 @@ static bool wsConnect(const char* tokenEnc)
         return false;
     }
 
-    /* Build upgrade path */
-    static char path[1024];
-    snprintf(path, sizeof(path),
-        "%s?transport=webSockets&clientProtocol=1.5"
-        "&connectionToken=%s&connectionData=%s",
-        SR_CONNECT, tokenEnc, HUB_DATA_ENC);
+    /* SignalR Core WS URL: /signalrcore?id=<connectionToken>
+       Token is short alphanumeric (URL-safe), no encoding needed */
+    static char path[256];
+    snprintf(path, sizeof(path), "%s?id=%s", SR_CONNECT, token);
 
-    /* RFC 6455 upgrade request – include ALB cookies from negotiate */
-    static char req[1536];
+    /* RFC 6455 upgrade request – include ALB sticky-session cookie */
+    static char req[1024];
     if (s_cookies[0]) {
         snprintf(req, sizeof(req),
             "GET %s HTTP/1.1\r\n"
@@ -625,15 +754,95 @@ static bool wsConnect(const char* tokenEnc)
     resp[rlen] = '\0';
 
     if (!strstr(resp, "101")) {
-        Serial.printf("[F1Net] WS upgrade failed: %.100s\n", resp);
+        setErr("WS upgrade: %.100s", resp);
+        tls_cleanup(*cp); delete cp;
+        return false;
+    }
+    Serial.println("[F1Net] WS upgrade 101 OK");
+
+    /* SignalR Core protocol handshake: must be sent as a proper masked
+       WebSocket text frame (RFC 6455), exactly like every other protocol
+       message.  Sending it as raw TLS bytes makes the server reply with a
+       WS close frame 1002 (protocol error) and drop the connection. */
+    if (!ws_send_text(*cp, HANDSHAKE_MSG)) {
+        Serial.println("[F1Net] Handshake write fail");
         tls_cleanup(*cp); delete cp;
         return false;
     }
 
-    /* Persist connection for ongoing WS use */
+    /* Persistent socket must be non-blocking so wsRead() can poll for
+       frames without select()/FIONREAD (unreliable on this build). */
+    tls_set_nonblocking(*cp);
+
+    /* Persist connection for ongoing WS use.  The {}\x1e handshake ack is
+       verified by connectSignalR() through the normal frame reader. */
     s_tls = cp;
-    Serial.println("[F1Net] WSS connected");
+    s_handshakeAcked = false;
+    s_handshakeErr   = false;
+    Serial.println("[F1Net] WSS connected (handshake sent)");
     return true;
+}
+
+/* Walk the RaceControlMessages backlog carried inside a (re)connect
+   type:3 snapshot and apply LED reactions from the most recent
+   messages.  This lets a device that boots (or reconnects) in the
+   middle of an incident show the correct flag state (e.g. red) even
+   though TrackStatus is stuck on code "2" (Yellow).  The messages are
+   processed oldest → newest so the LAST one wins; nothing is written
+   to the event log (that would replay "all past events"). */
+static void processSnapshotRcBacklog(const char* msg)
+{
+    if (!g_cfg.react_global && !g_cfg.react_sector) return;
+    const char* rc = strstr(msg, "\"RaceControlMessages\"");
+    if (!rc) return;
+    const char* arr = strchr(rc, '[');
+    if (!arr) return;
+
+    struct Back { char cat[16], flag[16], scope[16], text[F1_EVENT_MSG_LEN]; };
+    static Back list[8];
+    int n = 0;   /* total messages seen */
+    const char* p = arr + 1;
+    while (p && *p && *p != ']') {
+        p = strchr(p, '{');
+        if (!p) break;
+        /* find matching closing brace (messages contain no nested braces) */
+        const char* q = p;
+        int depth = 0;
+        while (*q) {
+            if (*q == '{') ++depth;
+            else if (*q == '}') { if (--depth == 0) { ++q; break; } }
+            ++q;
+        }
+        if (depth != 0) break;
+        size_t sl = (size_t)(q - p);
+        if (sl > 700) sl = 700;
+        static char buf[704];
+        memcpy(buf, p, sl);
+        buf[sl] = '\0';
+
+        Back b;
+        b.cat[0] = b.flag[0] = b.scope[0] = b.text[0] = '\0';
+        json_str(buf, "Category", b.cat, sizeof(b.cat));
+        json_str(buf, "Flag",     b.flag, sizeof(b.flag));
+        json_str(buf, "Scope",    b.scope, sizeof(b.scope));
+        json_str(buf, "Message",  b.text, sizeof(b.text));
+        list[n % 8] = b;      /* rolling window – keeps the newest 8 */
+        ++n;
+        p = q;
+    }
+
+    Serial.printf("[F1Net] Snapshot RC backlog: %d messages\n", n);
+    int start = (n > 8) ? (n - 8) : 0;
+    for (int i = start; i < n; i++) {
+        const Back* bi = &list[i % 8];
+        F1NetState st = rcEventToState(bi->cat, bi->flag,
+                                       bi->scope, bi->text);
+        if (st != F1ST_UNKNOWN) {
+            Serial.printf("[F1Net] backlog -> state %d (%s)\n",
+                          (int)st, bi->text);
+            applyState(st);
+        }
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -641,48 +850,78 @@ static bool wsConnect(const char* tokenEnc)
    ---------------------------------------------------------------- */
 static void processMessage(const char* msg, int len)
 {
-    /* Ignore keepalive {} */
+    /* Ignore empty or whitespace-only (keepalive) */
     if (len <= 2) return;
 
-    /* ── Initial snapshot frame: {"R": {"TrackStatus":{...},"SessionStatus":{...}}} ── */
-    const char* rp = strstr(msg, "\"R\":");
-    if (rp) {
-        rp += 4;
-        while (*rp == ' ') ++rp;
-        if (*rp == '{') {
-            /* Extract TrackStatus.Status */
-            const char* tsp = strstr(rp, "\"TrackStatus\"");
+    /* Handshake acknowledgement: the server answers the handshake with a
+       short "{}\x1e" text frame.  Record it so connectSignalR() can
+       subscribe only after the protocol handshake completed. */
+    if (strstr(msg, "{}")) {
+        s_handshakeAcked = true;
+        Serial.println("[F1Net] Handshake ack received");
+        return;
+    }
+    /* Server-side handshake rejection ({"error":...}) */
+    if (strstr(msg, "\"error\"")) {
+        s_handshakeErr = true;
+        setErr("WS handshake rejected: %.80s", msg);
+        return;
+    }
+
+    /* ── SignalR Core type:6 ping → reply with ping ─────────────────── */
+    if (strstr(msg, "\"type\":6")) {
+        ws_send_text(*s_tls, "{\"type\":6}\x1e");
+        return;
+    }
+
+    /* ── SignalR Core type:7 close ───────────────────────────────────── */
+    if (strstr(msg, "\"type\":7")) {
+        Serial.println("[F1Net] WS close recv (type:7)");
+        scheduleReconnect("type7");
+        return;
+    }
+
+
+    /* ── SignalR Core type:3  (Completion / initial snapshot) ─────────
+       {"type":3,"invocationId":"0","result":{"TrackStatus":{...},"SessionStatus":{...},...}}
+       The "result" field has the same structure as the old "R" field.     */
+    const char* resultPtr = strstr(msg, "\"result\":");
+    if (resultPtr && strstr(msg, "\"type\":3")) {
+        resultPtr += 9;
+        while (*resultPtr == ' ') ++resultPtr;
+        if (*resultPtr == '{') {
+            /* Fresh (re)connect snapshot: tell the consumer to drop any
+               stale queued states first, so only the CURRENT on-track
+               state is applied after a boot/reconnect. */
+            if (s_snapshotCb) s_snapshotCb();
+
+            const char* tsp = strstr(resultPtr, "\"TrackStatus\"");
             if (tsp) {
                 char code[8] = {};
                 json_str(tsp, "Status", code, sizeof(code));
                 if (code[0]) {
                     F1NetState ns = trackCodeToState(code);
-                    Serial.printf("[F1Net] Snapshot TrackStatus=%s\n", code);
-                    char evMsg[F1_EVENT_MSG_LEN];
-                    static const char* TRK_NAMES[] = {
-                        "Idle","Green","Yellow","Yellow","Safety Car",
-                        "Red Flag","VSC","VSC Ending"};
-                    int ci = code[0] - '0';
-                    const char* tn = (ci >= 0 && ci <= 7) ? TRK_NAMES[ci] : code;
-                    snprintf(evMsg, sizeof(evMsg), "Track: %s (snapshot)", tn);
-                    logEvent("Track", evMsg);
-                    applyState(ns);
+                    char tmsg[24] = {};
+                    json_str(tsp, "Message", tmsg, sizeof(tmsg));
+                    Serial.printf("[F1Net] Snapshot TrackStatus=%s (%s)\n",
+                                  code, tmsg[0] ? tmsg : "?");
+                    /* NOTE: not written to the event log on purpose – a
+                       snapshot reflects the state AT BOOT/CONNECT, not a
+                       new event, and showing it with the boot timestamp
+                       misleads (e.g. "Green" at 10:45 when the flag
+                       actually changed an hour earlier). */
+                    if (g_cfg.react_track) applyState(ns);
                 }
             }
-            /* Extract SessionStatus.Status */
-            const char* ssp = strstr(rp, "\"SessionStatus\"");
+            const char* ssp = strstr(resultPtr, "\"SessionStatus\"");
             if (ssp) {
                 char status[32] = {};
                 json_str(ssp, "Status", status, sizeof(status));
                 if (status[0]) {
                     Serial.printf("[F1Net] Snapshot SessionStatus=%s\n", status);
-                    char evMsg[F1_EVENT_MSG_LEN];
-                    snprintf(evMsg, sizeof(evMsg), "Session: %s (snapshot)", status);
-                    logEvent("Session", evMsg);
                     if (strstr(status, "Started")) {
                         s_sessionActive = true;
                         s_sessEndEpoch  = 0;
-                        /* Don't fire SESSION_START from snapshot – session already running */
                     } else if (strstr(status, "Finished") || strstr(status, "Ends")) {
                         s_sessEndEpoch = (uint32_t)time(nullptr);
                         applyState(F1ST_CHEQUERED);
@@ -695,219 +934,240 @@ static void processMessage(const char* msg, int len)
                 }
             }
         }
+        /* Re-derive the flag state from the snapshot's race-control
+           backlog (most recent messages win), so booting mid-incident
+           shows the correct colour. */
+        processSnapshotRcBacklog(msg);
+        return;  /* snapshot fully handled */
     }
 
-    /* Look for "M" array (push messages) */
-    const char* mp = strstr(msg, "\"M\":");
-    if (!mp) return;
-    mp += 4;
-    while (*mp == ' ') ++mp;
-    if (*mp != '[') return;
+    /* ── SignalR Core type:1 with target "feed" (live push) ───────────
+       {"type":1,"target":"feed","arguments":["TopicName",<timestamp>,<data>]}
+       arguments[0] = topic string
+       arguments[1..] = timestamp string + data object (order may vary)     */
+    if (!strstr(msg, "\"type\":1") || !strstr(msg, "\"feed\"")) return;
 
-    /* Iterate messages in array */
-    const char* cursor = mp + 1;
-    while (*cursor && *cursor != ']') {
-        if (*cursor != '{') { ++cursor; continue; }
+    const char* ap = strstr(msg, "\"arguments\":");
+    if (!ap) return;
+    ap += 12;
+    while (*ap == ' ') ++ap;
+    if (*ap != '[') return;
+    ++ap;  /* skip '[' */
+    while (*ap == ' ') ++ap;
 
-        /* Get "H" hub name */
-        char hub[64] = {};
-        json_str(cursor, "H", hub, sizeof(hub));
+    /* First element: topic name string */
+    if (*ap != '"') return;
+    char topic[64] = {};
+    size_t ti = 0;
+    ++ap;  /* skip opening '"' */
+    while (*ap && *ap != '"' && ti < sizeof(topic)-1) topic[ti++] = *ap++;
+    topic[ti] = '\0';
+    if (*ap == '"') ++ap;  /* skip closing '"' */
+    /* Skip comma + optional timestamp arg to reach data object/string */
+    while (*ap == ',' || *ap == ' ') ++ap;
+    /* Skip the timestamp string if present (starts with '"') */
+    if (*ap == '"') {
+        ++ap;
+        while (*ap && *ap != '"') ++ap;
+        if (*ap == '"') ++ap;
+        while (*ap == ',' || *ap == ' ') ++ap;
+    }
+    /* ap now points to the data argument (object, string, or end of array) */
 
-        /* Get "M" method name */
-        char method[64] = {};
-        json_str(cursor, "M", method, sizeof(method));
+    if (strcasecmp(topic, "TrackStatus") == 0) {
+        char code[8] = {};
+        char tmsg[24] = {};
+        json_str(ap, "Status", code, sizeof(code));
+        if (code[0]) {
+            json_str(ap, "Message", tmsg, sizeof(tmsg));
+            F1NetState ns = trackCodeToState(code);
+            Serial.printf("[F1Net] TrackStatus=%s (%s)\n", code,
+                          tmsg[0] ? tmsg : "?");
+            static const char* TRK_NAMES[] = {
+                "Idle","Green","Yellow","?","Safety Car",
+                "Red Flag","VSC","VSC Ending"};
+            int ci = code[0] - '0';
+            const char* tn = (ci>=0 && ci<=7) ? TRK_NAMES[ci] : code;
+            char lmsg[F1_EVENT_MSG_LEN];
+            snprintf(lmsg, sizeof(lmsg), "Track: %s", tn);
+            logEvent("Track", lmsg);
+            /* LED reacts to TrackStatus codes only when enabled */
+            if (g_cfg.react_track) applyState(ns);
+        }
+    }
+    else if (strcasecmp(topic, "SessionStatus") == 0) {
+        char status[32] = {};
+        json_str(ap, "Status", status, sizeof(status));
+        Serial.printf("[F1Net] SessionStatus=%s\n", status);
+        char smsg[F1_EVENT_MSG_LEN];
+        snprintf(smsg, sizeof(smsg), "Session: %s", status);
+        logEvent("Session", smsg);
+        if (strstr(status, "Started")) {
+            s_sessionActive = true;
+            s_sessEndEpoch = 0;
+            applyState(F1ST_SESSION_START);
+        } else if (strstr(status, "Finished") || strstr(status, "Ends")) {
+            s_sessEndEpoch = (uint32_t)time(nullptr);
+            applyState(F1ST_CHEQUERED);
+        } else if (strstr(status, "Inactive")) {
+            s_sessionActive = false;
+            if (s_sessEndEpoch == 0)
+                s_sessEndEpoch = (uint32_t)time(nullptr);
+            applyState(F1ST_IDLE);
+        }
+    }
+    else if (strcasecmp(topic, "RaceControlMessages") == 0) {
+        /* Structured race-control message.  Live pushes carry a single new
+           message:
+             {"Messages":{"<id>":{"Category":"Flag","Flag":"YELLOW",
+              "Scope":"Sector","Message":"YELLOW IN TRACK SECTOR 13",...}}} */
+        char cat[16] = {}, flag[16] = {}, scope[16] = {};
+        char rcMsg[F1_EVENT_MSG_LEN] = {};
+        json_str(ap, "Category", cat, sizeof(cat));
+        json_str(ap, "Flag",     flag, sizeof(flag));
+        json_str(ap, "Scope",    scope, sizeof(scope));
+        json_str(ap, "Message",  rcMsg, sizeof(rcMsg));
 
-        if (strcasecmp(hub, "Streaming") == 0 &&
-            strcasecmp(method, "feed") == 0)
-        {
-            /* Extract "A" args array content */
-            const char* ap = strstr(cursor, "\"A\":");
-            if (ap) {
-                ap += 4;
-                while (*ap == ' ') ++ap;
-                if (*ap == '[') {
-                    ++ap;
-                    /* First arg is topic name */
-                    if (*ap == '"') {
-                        char topic[64] = {};
-                        size_t ti = 0;
-                        ++ap;
-                        while (*ap && *ap != '"' && ti < sizeof(topic)-1)
-                            topic[ti++] = *ap++;
-                        topic[ti] = '\0';
-
-                        if (strcasecmp(topic, "TrackStatus") == 0) {
-                            /* Skip to second arg (status object) */
-                            if (*ap == '"') { ++ap; } /* closing quote */
-                            while (*ap == ',' || *ap == ' ') ++ap;
-                            char code[8] = {};
-                            json_str(ap, "Status", code, sizeof(code));
-                            if (code[0]) {
-                                F1NetState ns = trackCodeToState(code);
-                                Serial.printf("[F1Net] TrackStatus=%s\n", code);
-                                /* Log the track status change */
-                                static const char* TRK_NAMES[] = {
-                                    "Idle","Green","Yellow","?","Safety Car",
-                                    "Red Flag","VSC","VSC Ending"};
-                                int ci = code[0] - '0';
-                                const char* tn = (ci>=0 && ci<=7) ? TRK_NAMES[ci] : code;
-                                char msg[F1_EVENT_MSG_LEN];
-                                snprintf(msg, sizeof(msg), "Track: %s", tn);
-                                logEvent("Track", msg);
-                                applyState(ns);
-                            }
-                        }
-                        else if (strcasecmp(topic, "SessionStatus") == 0) {
-                            if (*ap == '"') { ++ap; }
-                            while (*ap == ',' || *ap == ' ') ++ap;
-                            char status[32] = {};
-                            json_str(ap, "Status", status, sizeof(status));
-                            Serial.printf("[F1Net] SessionStatus=%s\n", status);
-                            /* Log session status */
-                            char smsg[F1_EVENT_MSG_LEN];
-                            snprintf(smsg, sizeof(smsg), "Session: %s", status);
-                            logEvent("Session", smsg);
-                            if (strstr(status, "Started")) {
-                                s_sessionActive = true;
-                                s_sessEndEpoch = 0;
-                                applyState(F1ST_SESSION_START);
-                            } else if (strstr(status, "Finished") ||
-                                       strstr(status, "Ends")) {
-                                s_sessEndEpoch = (uint32_t)time(nullptr);
-                                applyState(F1ST_CHEQUERED);
-                            } else if (strstr(status, "Inactive")) {
-                                s_sessionActive = false;
-                                if (s_sessEndEpoch == 0)
-                                    s_sessEndEpoch = (uint32_t)time(nullptr);
-                                applyState(F1ST_IDLE);
-                            }
-                        }
-                        else if (strcasecmp(topic, "RaceControlMessages") == 0) {
-                            if (*ap == '"') { ++ap; }
-                            while (*ap == ',' || *ap == ' ') ++ap;
-                            /* Extract the Message text for the event log */
-                            char rcMsg[F1_EVENT_MSG_LEN] = {};
-                            json_str(ap, "Message", rcMsg, sizeof(rcMsg));
-                            if (rcMsg[0]) {
-                                logEvent("RaceCtrl", rcMsg);
-                                Serial.printf("[F1Net] RaceCtrl: %s\n", rcMsg);
-                            }
-                            /* Simple substring search – messages are small and well-known */
-                            if (strstr(ap, "FASTEST LAP") || strstr(ap, "Fastest Lap")) {
-                                Serial.println("[F1Net] ↯ Fastest lap detected");
-                                if (s_eventCallback) s_eventCallback(F1EVT_FASTEST_LAP);
-                            }
-                            /* DRS: look for both strings to avoid false positives */
-                            if ((strstr(ap, "DRS") || strstr(ap, "Drs"))
-                                    && (strstr(ap, "ENABLED") || strstr(ap, "Enabled"))) {
-                                Serial.println("[F1Net] ↯ DRS enabled");
-                                if (s_eventCallback) s_eventCallback(F1EVT_DRS_ENABLED);
-                            }
-                        }
-                    }
-                }
-            }
+        /* Log every race-control message (user wants the full picture) */
+        if (rcMsg[0]) {
+            logEvent("RaceCtrl", rcMsg);
+            Serial.printf("[F1Net] RaceCtrl: %s\n", rcMsg);
         }
 
-        /* Advance to next object */
-        while (*cursor && *cursor != '}') ++cursor;
-        if (*cursor == '}') ++cursor;
-        while (*cursor == ',' || *cursor == ' ') ++cursor;
+        /* ── LED flag-state transitions ─────────────────────────────────
+           The TrackStatus topic in this feed can stay on code 2 ("Yellow")
+           even through safety-car / red-flag periods, so the flag the TV
+           mirrors mostly comes from RaceControlMessages.  Derive state
+           changes via the user-configurable rcEventToState(). */
+        F1NetState rcState = rcEventToState(cat, flag, scope, rcMsg);
+        if (rcState != F1ST_UNKNOWN) {
+            Serial.printf("[F1Net] RC flag -> state %d\n", (int)rcState);
+            applyState(rcState);
+        }
+
+        /* Auxiliary event flashes (fastest lap / DRS) – text based */
+        if (f1_contains_ci(rcMsg, "FASTEST LAP")) {
+            Serial.println("[F1Net] ↯ Fastest lap detected");
+            if (s_eventCallback) s_eventCallback(F1EVT_FASTEST_LAP);
+        }
+        if (f1_contains_ci(rcMsg, "DRS") && f1_contains_ci(rcMsg, "ENABLED")) {
+            Serial.println("[F1Net] ↯ DRS enabled");
+            if (s_eventCallback) s_eventCallback(F1EVT_DRS_ENABLED);
+        }
     }
 }
 
 /* ----------------------------------------------------------------
    Read + process pending WS frames (non-blocking, called from loop)
    ---------------------------------------------------------------- */
+/* Read + process one complete WS frame from the (non-blocking) stream.
+   Returns:
+      1  - one frame fully read & dispatched
+      0  - nothing available right now (soft; retry next tick)
+     -1  - fatal error / close; scheduleReconnect() already issued
+ */
+static int wsReadOneFrame()
+{
+    TlsConn& c = *s_tls;
+    uint8_t hdr2[2];
+    int s = wsReadFull(c, hdr2, 2, 2000, true);
+    if (s <= 0) return s;                  /* 0 = no data yet, -1 = fatal */
+
+    uint8_t op  = hdr2[0] & 0x0F;
+    bool masked = (hdr2[1] & 0x80) != 0;
+    uint64_t payLen = hdr2[1] & 0x7F;
+
+    /* Extended length */
+    if (payLen == 126) {
+        uint8_t ext[2];
+        if (wsReadFull(c, ext, 2, 2000, false) != 1) {
+            scheduleReconnect("ext-read"); return -1;
+        }
+        payLen = ((uint64_t)ext[0] << 8) | ext[1];
+    } else if (payLen == 127) {
+        uint8_t ext[8];
+        if (wsReadFull(c, ext, 8, 2000, false) != 1) {
+            scheduleReconnect("ext8-read"); return -1;
+        }
+        payLen = 0;
+        for (int i = 0; i < 8; ++i) payLen = (payLen << 8) | ext[i];
+    }
+
+    /* Server frames shouldn't be masked, but handle anyway */
+    uint8_t mask[4] = {};
+    if (masked) {
+        if (wsReadFull(c, mask, 4, 2000, false) != 1) {
+            scheduleReconnect("mask-read"); return -1;
+        }
+    }
+
+    /* Read payload */
+    if (payLen > sizeof(s_wsBuf) - 1) {
+        /* Frame too large for buffer – read what fits, parse it for
+           state/session info (TrackStatus & SessionStatus appear early
+           in the snapshot), then drain and discard the remainder. */
+        size_t toRead = sizeof(s_wsBuf) - 1;
+        int r = wsReadFull(c, (uint8_t*)s_wsBuf, toRead, 5000, false);
+        if (r != 1) { scheduleReconnect("big-read"); return -1; }
+        if (masked) {
+            for (size_t i = 0; i < toRead; ++i) s_wsBuf[i] ^= mask[i & 3];
+        }
+        s_wsBuf[toRead] = '\0';
+        Serial.printf("[F1Net] Oversized frame %llu B - parsing first %u B\n",
+                      (unsigned long long)payLen, (unsigned)toRead);
+        processMessage(s_wsBuf, (int)toRead);
+        uint64_t skip = payLen - (uint64_t)toRead;
+        uint8_t discard[256];
+        while (skip > 0) {
+            size_t chunk = (skip > sizeof(discard)) ? sizeof(discard) : (size_t)skip;
+            int r2 = wsReadFull(c, discard, chunk, 5000, false);
+            if (r2 != 1) { scheduleReconnect("drain-read"); return -1; }
+            skip -= (size_t)chunk;
+        }
+    } else if (payLen > 0) {
+        int r = wsReadFull(c, (uint8_t*)s_wsBuf, (size_t)payLen, 5000, false);
+        if (r != 1) { scheduleReconnect("payload-read"); return -1; }
+        if (masked) {
+            for (uint64_t i = 0; i < payLen; ++i) s_wsBuf[i] ^= mask[i & 3];
+        }
+        s_wsBuf[payLen] = '\0';
+    }
+
+    s_lastData = millis();
+    s_lastOp   = op;
+    ++s_frameCount;
+
+    /* Handle opcodes */
+    if (op == 0x8) {
+        /* Close */
+        Serial.println("[F1Net] WS close recv");
+        scheduleReconnect("ws-close");
+        return -1;
+    }
+    if (op == 0x9) {
+        /* Ping – send pong */
+        uint8_t pong[6] = {0x8A, 0x80, 0x00, 0x00, 0x00, 0x00};
+        tls_write_all(*s_tls, pong, sizeof(pong));
+    }
+    if (op == 0xA) {
+        /* Pong – ignore */
+    }
+    if ((op == 0x1 || op == 0x0) && payLen > 0) {
+        /* Text / continuation frame */
+        processMessage(s_wsBuf, (int)payLen);
+    }
+    return 1;
+}
+
+/* Read + dispatch pending WS frames.  Non-blocking when the socket is
+   idle (mbedtls returns WANT_READ immediately); never spins. */
 static void wsRead()
 {
     if (!s_tls) return;
-    if (!tls_data_available(*s_tls)) return;
-
-    /* Process frames while data keeps arriving */
-    while (true) {
-        /* Read 2-byte WebSocket frame header */
-        uint8_t hdr2[2];
-        if (tls_read_exact(*s_tls, hdr2, 2, 2000) != 2) {
-            scheduleReconnect(); return;
-        }
-
-        bool fin    = (hdr2[0] & 0x80) != 0;
-        uint8_t op  =  hdr2[0] & 0x0F;
-        bool masked = (hdr2[1] & 0x80) != 0;
-        uint64_t payLen = hdr2[1] & 0x7F;
-
-        /* Extended length */
-        if (payLen == 126) {
-            uint8_t ext[2];
-            if (tls_read_exact(*s_tls, ext, 2, 500) != 2) {
-                scheduleReconnect(); return;
-            }
-            payLen = ((uint64_t)ext[0] << 8) | ext[1];
-        } else if (payLen == 127) {
-            uint8_t ext[8];
-            if (tls_read_exact(*s_tls, ext, 8, 500) != 8) {
-                scheduleReconnect(); return;
-            }
-            payLen = 0;
-            for (int i = 0; i < 8; ++i) payLen = (payLen << 8) | ext[i];
-        }
-
-        /* Server frames shouldn't be masked, but handle anyway */
-        uint8_t mask[4] = {};
-        if (masked) {
-            if (tls_read_exact(*s_tls, mask, 4, 500) != 4) {
-                scheduleReconnect(); return;
-            }
-        }
-
-        /* Read payload */
-        if (payLen > sizeof(s_wsBuf) - 1) {
-            /* Too large — skip by reading and discarding */
-            uint64_t skip = payLen;
-            uint8_t discard[256];
-            while (skip > 0) {
-                size_t chunk = (skip > sizeof(discard))
-                               ? sizeof(discard) : (size_t)skip;
-                int r = tls_read_exact(*s_tls, discard, chunk, 5000);
-                if (r <= 0) { scheduleReconnect(); return; }
-                skip -= (size_t)r;
-            }
-        } else if (payLen > 0) {
-            int r = tls_read_exact(*s_tls, (uint8_t*)s_wsBuf,
-                                    (size_t)payLen, 5000);
-            if (r != (int)payLen) { scheduleReconnect(); return; }
-            if (masked) {
-                for (uint64_t i = 0; i < payLen; ++i)
-                    s_wsBuf[i] ^= mask[i & 3];
-            }
-            s_wsBuf[payLen] = '\0';
-        }
-
-        s_lastData = millis();
-
-        /* Handle opcodes */
-        if (op == 0x8) {
-            /* Close */
-            Serial.println("[F1Net] WS close recv");
-            scheduleReconnect();
-            return;
-        }
-        if (op == 0x9) {
-            /* Ping – send pong */
-            uint8_t pong[6] = {0x8A, 0x80, 0x00, 0x00, 0x00, 0x00};
-            tls_write_all(*s_tls, pong, sizeof(pong));
-        }
-        if (op == 0xA) {
-            /* Pong – ignore */
-        }
-        if ((op == 0x1 || op == 0x0) && payLen > 0) {
-            /* Text / continuation frame */
-            processMessage(s_wsBuf, (int)payLen);
-        }
-
-        /* Check if more frames are waiting */
-        if (!tls_data_available(*s_tls)) break;
+    for (int frames = 0; frames < 8; ++frames) {
+        int r = wsReadOneFrame();
+        if (r < 0) return;    /* fatal – reconnect already scheduled */
+        if (r == 0) return;   /* no data right now */
     }
 }
 
@@ -918,19 +1178,21 @@ static void connectSignalR()
 {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    /* Static: avoids 3 KB of stack. Safe – only called from single f1net task. */
-    static char token[512];
-    static char tokenEnc[1280];
+    static uint32_t s_attempt = 0;
+    Serial.printf("[F1Net] connectSignalR attempt #%u (backoff=%ums) heap=%u\n",
+                  ++s_attempt, s_reconnDelay, (unsigned)esp_get_free_heap_size());
+
+    /* Static: avoids stack. Safe – only called from single f1net task.
+       SignalR Core token is short alphanumeric, no URL-encoding needed. */
+    static char token[128];
     token[0] = '\0';
     if (!negotiate(token, sizeof(token))) {
-        scheduleReconnect();
+        scheduleReconnect("neg-fail");
         return;
     }
 
-    url_encode(token, tokenEnc, sizeof(tokenEnc));
-
-    if (!wsConnect(tokenEnc)) {
-        scheduleReconnect();
+    if (!wsConnect(token)) {
+        scheduleReconnect("ws-fail");
         return;
     }
 
@@ -940,8 +1202,30 @@ static void connectSignalR()
     s_lastData  = millis();
     s_reconnDelay = RECONNECT_INIT_MS;  /* reset back-off on success */
 
+    /* Pump frames until the server acknowledges the protocol handshake
+       ({}\x1e) or rejects it.  Subscribe must not go out before the ack:
+       the server otherwise treats the stream as not-yet-handshaken. */
+    {
+        unsigned long t0 = millis();
+        while (!s_handshakeAcked && !s_handshakeErr
+                && millis() - t0 < 4000) {
+            wsRead();
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    if (s_handshakeErr || !s_handshakeAcked) {
+        setErr("WS handshake not confirmed");
+        scheduleReconnect("hs-ack");
+        return;
+    }
+    Serial.println("[F1Net] Handshake OK");
+
     /* SignalR subscribe */
-    ws_send_text(*s_tls, SUBSCRIBE_MSG);
+    if (!ws_send_text(*s_tls, SUBSCRIBE_MSG)) {
+        setErr("Subscribe write failed");
+        scheduleReconnect("sub-write");
+        return;
+    }
     Serial.println("[F1Net] Subscribed");
 }
 
@@ -951,84 +1235,74 @@ static void connectSignalR()
 
 void f1net_setCallback(F1NetStateCB cb)      { s_callback      = cb; }
 void f1net_setEventCallback(F1EventCB cb)    { s_eventCallback = cb; }
+void f1net_setSnapshotCallback(F1SnapshotCB cb) { s_snapshotCb = cb; }
 
 void f1net_setup(void)
 {
     Serial.println("[F1Net] setup (TLS)");
+    /* Request the season session list NOW, before the WSS connects:
+       the CDN fetch needs ~40 kB of TLS buffers and the live connection
+       would otherwise have taken them (observed "SSL setup: Memory
+       allocation failed" whenever it ran after the WSS was up). */
+    if (!f1sessions_hasData()) f1sessions_requestFetch();
     s_lastConnect = millis() - RECONNECT_INIT_MS;  /* connect immediately */
 }
 
 void f1net_loop(void)
 {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    /* ── Sessions fetch request ──────────────────────────────────────────
-       The WebUI sets a flag via f1sessions_requestFetch().  We handle it
-       here so there is only ONE TLS connection at a time – opening a
-       second one would exhaust the lwIP socket pool on ESP32-C3 and
-       block the AsyncWebServer from sending any responses.              */
-    if (f1sessions_fetchRequested()) {
-        Serial.println("[F1Net] Sessions fetch requested – tearing down WS");
-        if (s_tls) {
-            tls_cleanup(*s_tls);
-            delete s_tls;
-            s_tls = nullptr;
-        }
-        s_wsOpen    = false;
-        s_connected = false;
-        /* Blocking fetch – reuses this task's stack, one TLS conn at a time */
-        f1sessions_fetch();
-        /* Schedule reconnect after a short delay */
-        s_lastConnect = millis();
-        s_reconnDelay = RECONNECT_INIT_MS;
+    if (WiFi.status() != WL_CONNECTED) {
+        s_connectPhase = "wifi";
         return;
+    }
+
+    /* ── Fetch requests (sessions / replay / calendar) ──────────────────
+       These open their OWN heap-allocated TlsConn in F1Sessions.cpp, so
+       they never touch this file's s_tls WSS handle. Instead of returning
+       immediately (blocking this task entirely and stalling wsRead() in
+       the live connection), we perform the fetch here, then refresh s_lastData
+       to ensure the live connection doesn't time out while we were busy. */
+    if (f1sessions_fetchRequested()) {
+        s_connectPhase = "sess";
+        Serial.println("[F1Net] Sessions fetch");
+        f1sessions_fetch();
+        if (s_wsOpen) s_lastData = millis();
+        /* Do NOT return here */
     }
 
     /* ── Session replay fetch request ────────────────────────────────── */
     if (f1sessions_replayRequested()) {
-        Serial.println("[F1Net] Replay fetch requested – tearing down WS");
-        if (s_tls) {
-            tls_cleanup(*s_tls);
-            delete s_tls;
-            s_tls = nullptr;
-        }
-        s_wsOpen    = false;
-        s_connected = false;
+        Serial.println("[F1Net] Replay fetch");
         f1sessions_fetchAndReplay();
-        s_lastConnect = millis();
-        s_reconnDelay = RECONNECT_INIT_MS;
-        return;
+        if (s_wsOpen) s_lastData = millis();
+        /* Do NOT return here */
     }
 
     /* ── Calendar API fetch request ──────────────────────────────────── */
     if (f1cal_apiFetchRequested()) {
-        Serial.println("[F1Net] Calendar API fetch requested – tearing down WS");
-        if (s_tls) {
-            tls_cleanup(*s_tls);
-            delete s_tls;
-            s_tls = nullptr;
-        }
-        s_wsOpen    = false;
-        s_connected = false;
+        s_connectPhase = "cal";
+        Serial.println("[F1Net] Calendar API fetch");
         f1cal_fetchApi();
-        s_lastConnect = millis();
-        s_reconnDelay = RECONNECT_INIT_MS;
-        return;
+        if (s_wsOpen) s_lastData = millis();
+        /* Do NOT return here */
     }
 
     if (!s_wsOpen) {
         unsigned long now = millis();
         if (now - s_lastConnect >= s_reconnDelay) {
+            s_connectPhase = "connecting";
             s_lastConnect = now;
             connectSignalR();
+        } else {
+            s_connectPhase = "wait";
         }
         return;
     }
+    s_connectPhase = "live";
 
     /* Check connection still alive */
     if (!s_tls) {
         Serial.println("[F1Net] TLS handle lost");
-        scheduleReconnect();
+        scheduleReconnect("tls-lost");
         return;
     }
 
@@ -1038,19 +1312,29 @@ void f1net_loop(void)
     /* Idle timeout */
     if (millis() - s_lastData > READ_TIMEOUT_MS) {
         Serial.println("[F1Net] WS idle timeout");
-        scheduleReconnect();
+        scheduleReconnect("idle-timeout");
         return;
     }
 
-    /* Send SignalR keepalive {} ping */
+    /* Send SignalR Core keepalive ping (type:6) */
     if (millis() - s_lastPing > PING_INTERVAL_MS) {
-        ws_send_text(*s_tls, "{}");
+        ws_send_text(*s_tls, "{\"type\":6}\x1e");
         s_lastPing = millis();
     }
 }
 
-bool       f1net_isConnected(void) { return s_wsOpen && s_tls != nullptr; }
+bool        f1net_isConnected(void)   { return s_wsOpen && s_tls != nullptr; }
+const char* f1net_connectPhase(void)  { return s_connectPhase; }
+const char* f1net_lastError(void)     { return s_lastErr[0] ? s_lastErr : ""; }
 F1NetState f1net_getState(void)    { return s_state; }
+
+void f1net_forceReconnect(void)
+{
+    /* Reset back-off and fire reconnect on the next f1net_loop() tick */
+    s_reconnDelay = RECONNECT_INIT_MS;
+    s_lastConnect = millis() - RECONNECT_INIT_MS;
+    Serial.println("[F1Net] Force reconnect requested");
+}
 
 void f1net_disconnect(void)
 {
@@ -1068,8 +1352,8 @@ void f1net_disconnect(void)
 int f1net_eventCount(void) {
     /* Auto-clear check */
     if (s_sessEndEpoch > 0 && s_evCount > 0) {
-        time_t now = time(nullptr);
-        if (now > (time_t)s_sessEndEpoch + 3600) {
+        long now = (long)f1_clock();
+        if (now > (long)s_sessEndEpoch + 3600L) {
             s_evCount = 0;
             s_evHead  = 0;
             s_sessEndEpoch = 0;

@@ -44,6 +44,17 @@ struct AppConfig {
     bool     feat_start_lights;  /* 5-red-lights countdown on session start        */
     bool     deep_sleep;         /* enter deep sleep between sessions              */
 
+    /* ── Which events the LED reacts to (all default ON except sector) ────
+       react_track : TrackStatus codes (green/yellow/SC/red/VSC…)           (ON)
+       react_global: global RaceControlMessages (red flag, safety car, VSC,
+                     chequered) – the flags the TV mirrors                   (ON)
+       react_sector: sector-local RaceControl notes ("YELLOW IN TRACK
+                     SECTOR x") treated as yellow                            (OFF)
+       Logging of events is independent – always happens.                   */
+    bool     react_track;        /* default true  */
+    bool     react_global;       /* default true  */
+    bool     react_sector;       /* default false */
+
     StateEffect states[CFG_NUM_STATES];
 
     // --- F1 event delay (seconds) ---

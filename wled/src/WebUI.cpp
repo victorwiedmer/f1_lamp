@@ -30,6 +30,11 @@ bool g_apMode = false;
 /* ── global server instance (port 80) ───────────────────────────────────── */
 static AsyncWebServer s_server(80);
 
+/* ── state for POST /api/file (LittleFS file streaming upload) ─────────── */
+static File    s_upFile;
+static bool    s_upOk   = false;
+static String  s_upPath;
+
 /* ── Minimal inline AP-mode WiFi setup page (fallback) ──────────────────── */
 static const char AP_WIFI_HTML[] PROGMEM = R"html(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -118,6 +123,35 @@ static void sendOk(AsyncWebServerRequest* req) {
     sendJson(req, "{\"ok\":true}");
 }
 
+/* JSON-encode *any* text as a safe string literal.  Raw control characters
+   (e.g. CR/LF captured from HTTP headers in error text) would otherwise
+   produce invalid JSON that breaks the browser's JSON.parse(). */
+static String jsonEscape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (unsigned int i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
 /* Serve a LittleFS file, with Cache-Control for static assets */
 static void serveFile(AsyncWebServerRequest* req, const char* path,
                       const char* contentType, bool cache = false) {
@@ -165,8 +199,7 @@ void webui_init(
         serveFile(req, "/common.css", "text/css", true);
     });
     s_server.on("/common.js", HTTP_GET, [](AsyncWebServerRequest* req) {
-        /* no-cache: JS changes with every firmware build */
-        serveFile(req, "/common.js", "application/javascript", false);
+        serveFile(req, "/common.js", "application/javascript", true);
     });
     s_server.on("/effects.html", HTTP_GET, [](AsyncWebServerRequest* req) {
         serveFile(req, "/effects.html", "text/html");
@@ -187,11 +220,14 @@ void webui_init(
     /* ── GET /api/status ────────────────────────────────────────────────── */
     s_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req) {
         JsonDocument doc;
-        doc["state"]     = (int)f1net_getState();
-        doc["connected"] = f1net_isConnected();
-        doc["ssid"]      = g_cfg.ssid;
-        doc["bri"]       = (int)g_cfg.brightness;
-        doc["f1ok"]      = f1net_isConnected();
+        doc["state"]         = (int)f1net_getState();
+        doc["connected"]     = f1net_isConnected();
+        doc["sessionActive"] = f1net_sessionActive();
+        doc["ssid"]          = g_cfg.ssid;
+        doc["bri"]           = (int)g_cfg.brightness;
+        doc["f1ok"]          = f1net_isConnected();
+        doc["f1phase"]        = f1net_connectPhase();
+        doc["f1err"]          = f1net_lastError();
         doc["ap"]        = g_apMode;
         doc["power"]     = g_cfg.power;
         doc["nextRace"]  = f1cal_hasData() ? f1cal_nextRaceLabel() : "—";
@@ -213,6 +249,12 @@ void webui_init(
         sendJson(req, out);
     });
 
+    /* ── GET /api/f1reconnect  – reset SignalR back-off and reconnect now ── */
+    s_server.on("/api/f1reconnect", HTTP_GET, [](AsyncWebServerRequest* req) {
+        f1net_forceReconnect();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+
     /* ── GET /api/config ────────────────────────────────────────────────── */
     s_server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
         JsonDocument doc;
@@ -223,6 +265,9 @@ void webui_init(
         doc["led_pin"]    = LED_PIN;
         doc["brightness"] = g_cfg.brightness;
         doc["delay_s"]    = g_cfg.delay_s;
+        doc["react_track"]  = g_cfg.react_track;
+        doc["react_global"] = g_cfg.react_global;
+        doc["react_sector"] = g_cfg.react_sector;
         JsonArray arr = doc["states"].to<JsonArray>();
         for (int i = 0; i < CFG_NUM_STATES; i++) {
           JsonObject s = arr.add<JsonObject>();
@@ -265,6 +310,12 @@ void webui_init(
           if (obj["delay_s"].is<int>()) {
             g_cfg.delay_s = obj["delay_s"] | 40;
           }
+          if (obj["react_track"].is<bool>())
+            g_cfg.react_track = obj["react_track"] | true;
+          if (obj["react_global"].is<bool>())
+            g_cfg.react_global = obj["react_global"] | true;
+          if (obj["react_sector"].is<bool>())
+            g_cfg.react_sector = obj["react_sector"] | false;
           JsonArray arr = obj["states"].as<JsonArray>();
           for (int i = 0; i < CFG_NUM_STATES && i < (int)arr.size(); i++) {
             JsonObject s = arr[i];
@@ -359,6 +410,9 @@ void webui_init(
         doc["drs"]          = g_cfg.feat_drs;
         doc["start_lights"] = g_cfg.feat_start_lights;
         doc["deep_sleep"]   = g_cfg.deep_sleep;
+        doc["track"]        = g_cfg.react_track;
+        doc["global"]       = g_cfg.react_global;
+        doc["sector"]       = g_cfg.react_sector;
         String out; serializeJson(doc, out);
         sendJson(req, out);
     });
@@ -371,6 +425,9 @@ void webui_init(
             if (obj["drs"].is<bool>())          g_cfg.feat_drs          = obj["drs"];
             if (obj["start_lights"].is<bool>()) g_cfg.feat_start_lights = obj["start_lights"];
             if (obj["deep_sleep"].is<bool>())   g_cfg.deep_sleep        = obj["deep_sleep"];
+            if (obj["track"].is<bool>())        g_cfg.react_track       = obj["track"];
+            if (obj["global"].is<bool>())       g_cfg.react_global      = obj["global"];
+            if (obj["sector"].is<bool>())       g_cfg.react_sector      = obj["sector"];
             cfg_save();
             sendOk(req);
         });
@@ -461,7 +518,7 @@ void webui_init(
         if (!f1sessions_hasData()) {
             const String& err = f1sessions_lastError();
             if (err.length() > 0) {
-                String j = "{\"error\":\"" + err + "\"}";
+                String j = "{\"error\":\"" + jsonEscape(err) + "\"}";
                 sendJson(req, j);
                 return;
             }
@@ -481,7 +538,7 @@ void webui_init(
         String j = "{\"fetching\":" + String(f1sessions_isFetching() ? "true" : "false")
                  + ",\"hasData\":" + String(f1sessions_hasData() ? "true" : "false")
                  + ",\"requested\":" + String(f1sessions_fetchRequested() ? "true" : "false")
-                 + ",\"error\":\"" + f1sessions_lastError() + "\""
+                 + ",\"error\":\"" + jsonEscape(f1sessions_lastError()) + "\""
                  + ",\"heap\":" + String(ESP.getFreeHeap())
                  + "}";
         sendJson(req, j);
@@ -537,10 +594,18 @@ void webui_init(
             sendJson(req, "{\"loading\":true}");
             return;
         }
+        /* Serve the full cached schedule (online fetch OR built-in fallback).
+           This is non-empty as soon as f1cal_update() has found a race, so the
+           card works even when the online calendar mirror is unreachable. */
+        const String& nr = f1cal_nextRaceJson();
+        if (nr.length() > 2) {
+            sendJson(req, nr);
+            return;
+        }
         if (!f1cal_apiFetched()) {
             const String& err = f1cal_apiError();
             if (err.length() > 0) {
-                String j = "{\"error\":\"" + err + "\"}";
+                String j = "{\"error\":\"" + jsonEscape(err) + "\"}";
                 sendJson(req, j);
                 return;
             }
@@ -637,6 +702,53 @@ void webui_init(
             }
         }
     );
+
+    /* ── POST /api/file?name=/index.html – stream a file to LittleFS ────
+       Lets UI files (html/css/js/json) be updated over the air without
+       re-flashing the whole filesystem (which would wipe /config.json).
+       Send as multipart:  curl -F "file=@index.html" ".../api/file?name=/index.html"
+       Only web-content extensions are accepted.                        */
+    s_server.on("/api/file", HTTP_POST,
+        [](AsyncWebServerRequest* req) {           /* onRequest (finished)  */
+            if (s_upFile) { s_upFile.close(); s_upFile = File(); }
+            if (!s_upOk) {
+                req->send(400, "text/plain", "upload failed");
+                return;
+            }
+            sendOk(req);
+        },
+        [](AsyncWebServerRequest* req, String filename, size_t index,
+           uint8_t* data, size_t len, bool final) {  /* onUpload (chunks)  */
+            if (index == 0) {
+                s_upPath = req->hasParam("name")
+                           ? req->getParam("name")->value()
+                           : ("/" + filename);
+                if (!s_upPath.startsWith("/")) s_upPath = "/" + s_upPath;
+                s_upOk = (s_upPath.endsWith(".html") || s_upPath.endsWith(".css")
+                          || s_upPath.endsWith(".js")  || s_upPath.endsWith(".json"))
+                         && (s_upPath.indexOf("..") < 0);
+                if (!s_upOk) { s_upPath = String(); return; }
+                if (LittleFS.exists(s_upPath)) LittleFS.remove(s_upPath);
+                s_upFile = LittleFS.open(s_upPath, "w");
+                if (!s_upFile) {
+                    Serial.printf("[WebUI] open %s for write failed\n",
+                                  s_upPath.c_str());
+                    s_upOk = false;
+                    return;
+                }
+                Serial.printf("[WebUI] upload -> %s\n", s_upPath.c_str());
+            }
+            if (s_upFile && s_upOk && len > 0) {
+                s_upFile.write(data, len);
+            }
+            if (final && s_upFile) {
+                s_upFile.close();
+                s_upFile = File();
+                if (s_upOk)
+                    Serial.printf("[WebUI] saved %s (%u bytes)\n",
+                                  s_upPath.c_str(), (unsigned)(index + len));
+            }
+        });
 
     /* ── 404 catch-all ──────────────────────────────────────────────────── */
     s_server.onNotFound([](AsyncWebServerRequest* req) {

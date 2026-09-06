@@ -91,6 +91,7 @@ static String s_nextRaceJson;          /* cached JSON for /api/nextrace   */
 static volatile bool s_apiFetchRequested = false;
 static volatile bool s_apiFetching       = false;
 static bool          s_apiFetched        = false;
+static bool          s_nextRaceFallbackBuilt = false;  /* built-in fallback done */
 static String        s_apiError;
 
 /* ── dynamic calendar storage (from LittleFS JSON) ──────────────────────── */
@@ -103,6 +104,11 @@ static struct DynEntry {
     char firstSessTime[10];
 } s_dynCal[MAX_DYN_RACES];
 static int s_dynCount = 0;
+
+/* Forward declaration (defined later in this file). */
+static void buildFallbackNextRace(const char* name,
+                                  const char* raceDate, const char* raceTime,
+                                  const char* fssDate,  const char* fssTime);
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -164,9 +170,22 @@ static int loadCustomCalendar() {
     File f = LittleFS.open("/calendar_custom.json", "r");
     if (!f) return 0;
 
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, f);
+    String body = f.readString();
     f.close();
+
+    /* Sanitize: remove ALL control characters (0-31).  Raw CR/LF/TAB
+       inside JSON string literals are invalid JSON and would make
+       deserializeJson() fail (or leak into string values). */
+    String sanitized;
+    sanitized.reserve(body.length());
+    for (int i = 0; i < (int)body.length(); i++) {
+        unsigned char c = (unsigned char)body[i];
+        if (c >= 32) sanitized.concat((char)c);
+    }
+    body = sanitized;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
     if (err) {
         Serial.printf("[F1Cal] Custom calendar parse error: %s\n", err.c_str());
         return 0;
@@ -194,8 +213,9 @@ static int loadCustomCalendar() {
     return s_dynCount;
 }
 
-/* Helper: scan a list of entries for the next upcoming race */
-static bool scanEntries(
+/* Helper: scan a list of entries for the next upcoming race.
+   Returns the matching index, or -1 when none qualifies. */
+static int scanEntries(
     const char* const* names,     /* array of name pointers  */
     const char* const* raceDates, /* array of raceDate ptrs  */
     const char* const* raceTimes, /* array of raceTime ptrs  */
@@ -203,36 +223,39 @@ static bool scanEntries(
     const char* const* fssTimes,  /* firstSessTime ptrs      */
     int count, time_t now)
 {
+    long nw = (long)now;
     for (int i = 0; i < count; i++) {
-        time_t raceEpoch = parseUtc(raceDates[i], raceTimes[i]);
+        long raceEpoch = (long)parseUtc(raceDates[i], raceTimes[i]);
         if (raceEpoch == 0) continue;
-        if (raceEpoch + 6 * 3600 < now) continue;
+        if (raceEpoch + 21600L < nw) continue;   /* finished > 6 h ago */
 
         strlcpy(s_raceName, names[i], sizeof(s_raceName));
         strlcpy(s_raceDate, raceDates[i], sizeof(s_raceDate));
 
-        struct tm raceDayTm;
-        gmtime_r(&raceEpoch, &raceDayTm);
-        raceDayTm.tm_hour = 0; raceDayTm.tm_min = 0; raceDayTm.tm_sec = 0;
-        s_raceEpoch = mktime(&raceDayTm);
+        /* UTC midnight of the race day — pure 32-bit arithmetic (the
+           hybrid newlib/picolibc toolchain corrupts time_t maths). */
+        s_raceEpoch = parseUtc(raceDates[i], "00:00:00");
 
         s_firstSessEpoch = parseUtc(fssDates[i], fssTimes[i]);
         s_hasData = true;
 
         Serial.printf("[F1Cal] Next: %s on %s  firstSess=%lu\n",
                       s_raceName, s_raceDate, (unsigned long)s_firstSessEpoch);
-        return true;
+        return i;
     }
-    return false;
+    return -1;
 }
 
 bool f1cal_update() {
-    /* NTP must be synced (epoch > year 2020) */
-    time_t now = time(nullptr);
-    if (now < 1577836800UL) {
+    /* NTP must be synced (epoch > year 2020).  f1_clock() masks the 64-bit
+       time_t upper word that the hybrid libc leaves full of garbage. */
+    long now = (long)f1_clock();
+    if (now < 1577836800L) {
         Serial.println("[F1Cal] NTP not synced – skipping calendar scan");
         return false;
     }
+
+    int idx = -1;
 
     /* Try custom calendar from LittleFS first */
     s_customLoaded = false;
@@ -250,8 +273,11 @@ bool f1cal_update() {
             fDates[i] = s_dynCal[i].firstSessDate;
             fTimes[i] = s_dynCal[i].firstSessTime;
         }
-        if (scanEntries(names, rDates, rTimes, fDates, fTimes, s_dynCount, now)) {
+        idx = scanEntries(names, rDates, rTimes, fDates, fTimes, s_dynCount, (time_t)now);
+        if (idx >= 0) {
             s_customLoaded = true;
+            buildFallbackNextRace(names[idx], rDates[idx], rTimes[idx],
+                                  fDates[idx], fTimes[idx]);
             return true;
         }
         Serial.println("[F1Cal] Custom calendar has no upcoming races, trying built-in");
@@ -271,7 +297,10 @@ bool f1cal_update() {
         fDates[i] = s_cal2026[i].firstSessDate;
         fTimes[i] = s_cal2026[i].firstSessTime;
     }
-    if (scanEntries(names, rDates, rTimes, fDates, fTimes, n, now)) {
+    idx = scanEntries(names, rDates, rTimes, fDates, fTimes, n, (time_t)now);
+    if (idx >= 0) {
+        buildFallbackNextRace(names[idx], rDates[idx], rTimes[idx],
+                              fDates[idx], fTimes[idx]);
         return true;
     }
 
@@ -281,27 +310,29 @@ bool f1cal_update() {
 
 float f1cal_idleFactor() {
     if (!s_hasData) return 0.0f;
-    time_t now    = time(nullptr);
-    time_t target = (s_firstSessEpoch > 0) ? s_firstSessEpoch : s_raceEpoch;
-    return f1_idleBrightnessFactor(now, target);
+    long now     = (long)f1_clock();
+    long target  = (s_firstSessEpoch > 0)
+                   ? (long)s_firstSessEpoch : (long)s_raceEpoch;
+    return f1_idleBrightnessFactor((time_t)now, (time_t)target);
 }
 
 bool f1cal_hasData() { return s_hasData; }
 
 bool f1cal_weekendActive() {
     if (!s_hasData) return false;
-    time_t now = time(nullptr);
-    return f1_weekendWindowActive(now, s_firstSessEpoch, s_raceEpoch);
+    long now = (long)f1_clock();
+    return f1_weekendWindowActive((time_t)now, s_firstSessEpoch, s_raceEpoch);
 }
 
 uint32_t f1cal_sleepSeconds() {
     if (!s_hasData) return 3600;
-    time_t now = time(nullptr);
-    double secsToWake = difftime(s_firstSessEpoch - 1800, now);
-    if (secsToWake < 7200.0)    return   300;   /* < 2 h   → wake every 5 min   */
-    if (secsToWake < 86400.0)   return   900;   /* < 24 h  → every 15 min       */
-    if (secsToWake < 604800.0)  return  1800;   /* < 7 d   → every 30 min       */
-    if (secsToWake < 1209600.0) return  3600;   /* < 14 d  → every 1 h          */
+    long now = (long)f1_clock();
+    long secsToWake = (s_firstSessEpoch > 0 ? (long)s_firstSessEpoch : (long)s_raceEpoch)
+                      - 1800L - now;
+    if (secsToWake < 7200L)     return   300;   /* < 2 h   → wake every 5 min   */
+    if (secsToWake < 86400L)    return   900;   /* < 24 h  → every 15 min       */
+    if (secsToWake < 604800L)   return  1800;   /* < 7 d   → every 30 min       */
+    if (secsToWake < 1209600L)  return  3600;   /* < 14 d  → every 1 h          */
     return 10800;                               /* > 14 d  → every 3 h          */
 }
 
@@ -309,9 +340,9 @@ const char* f1cal_nextRaceDate() { return s_raceDate; }
 
 int f1cal_daysUntilRace() {
     if (!s_hasData) return INT16_MIN;
-    time_t now = time(nullptr);
-    double diffSec = difftime(s_raceEpoch, now);
-    return (int)(diffSec / 86400.0);
+    long now = (long)f1_clock();
+    long diffSec = (long)s_raceEpoch - now;
+    return (int)(diffSec / 86400L);
 }
 
 const char* f1cal_nextRaceLabel() {
@@ -382,16 +413,69 @@ static void addSession(const char* name, const char* dateTime) {
     s_nextRace.sessionCount++;
 }
 
+/* Format a race name into a display label, appending " Grand Prix" only
+   when the source name does not already carry it (Jolpica names e.g.
+   "Australian Grand Prix" must not become "... Grand Prix Grand Prix"). */
+static void raceNameFor(const char* base, char* out, size_t n) {
+    strlcpy(out, base, n);
+    size_t len = strlen(out);
+    if (len >= 5 && strcasecmp(out + len - 5, "prix") == 0) return;
+    if (len >= 2 && strcasecmp(out + len - 2, "gp") == 0) return;
+    if (len + 12 < n) strlcat(out, " Grand Prix", n);
+}
+
+/* Populate s_nextRace from the built-in / custom calendar so /api/nextrace
+   always has something to show even when the online calendar fetch fails.
+   Runs only until the API has succeeded (fromApi data wins afterwards). */
+static void buildFallbackNextRace(const char* name,
+                                  const char* raceDate, const char* raceTime,
+                                  const char* fssDate,  const char* fssTime) {
+    if (s_apiFetched) return;             /* online data already preferred */
+    if (s_nextRaceFallbackBuilt) return;
+
+    char dt[22];
+    s_nextRace.sessionCount = 0;
+    raceNameFor(name, s_nextRace.raceName, sizeof(s_nextRace.raceName));
+    s_nextRace.round = 0;
+    s_nextRace.fromApi = false;
+    s_nextRace.circuitName[0] = '\0';
+    s_nextRace.locality[0]    = '\0';
+    s_nextRace.country[0]     = '\0';
+
+    if (raceDate[0] && raceTime[0]) {
+        snprintf(dt, sizeof(dt), "%sT%s", raceDate, raceTime);
+        addSession("Race", dt);
+    }
+    /* Built-in entries always carry a first session (FP1 / SprintQ). */
+    if (fssDate[0] && fssTime[0]) {
+        snprintf(dt, sizeof(dt), "%sT%s", fssDate, fssTime);
+        addSession("FP1", dt);
+    }
+    s_nextRaceFallbackBuilt = true;
+    buildNextRaceJson();
+    Serial.printf("[F1Cal] Fallback next race cached: %s (%d sessions)\n",
+                  s_nextRace.raceName, s_nextRace.sessionCount);
+}
+
 bool f1cal_fetchApi() {
     s_apiFetchRequested = false;
     s_apiFetching = true;
     s_apiError = "";
 
-    /* Determine current year from NTP */
-    time_t now = time(nullptr);
-    struct tm tmNow;
-    gmtime_r(&now, &tmNow);
-    int year = tmNow.tm_year + 1900;
+    /* Determine current year from NTP (ensure synced).
+       f1_clock() masks the 64-bit time_t upper word that the hybrid libc
+       leaves full of garbage. */
+    long now = (long)f1_clock();
+    if (now < 1740000000L) { // 2025-02-19
+        Serial.println("[F1Cal] NTP not synced, aborting fetch");
+        s_apiFetching = false;
+        return false;
+    }
+    int year;
+    {
+        unsigned mo, d, h, mi, s;
+        f1_fieldsFromEpoch((time_t)now, year, mo, d, h, mi, s);
+    }
 
     Serial.printf("[F1Cal] Fetching f1calendar %d  heap=%u\n",
                   year, ESP.getFreeHeap());
@@ -415,9 +499,23 @@ bool f1cal_fetchApi() {
 
     Serial.printf("[F1Cal] f1calendar body: %u bytes  heap=%u\n",
                   body.length(), ESP.getFreeHeap());
+    Serial.printf("[F1Cal] Body hex head: %02x %02x %02x %02x %02x\n",
+        (unsigned char)body[0], (unsigned char)body[1], (unsigned char)body[2], (unsigned char)body[3], (unsigned char)body[4]);
+
+    /* Sanitize: remove ALL control characters (0-31).  Raw CR/LF/TAB
+       inside JSON string literals are invalid JSON and would make
+       deserializeJson() fail (or leak into the session values we cache). */
+    String sanitized;
+    sanitized.reserve(body.length());
+    for (int i = 0; i < (int)body.length(); i++) {
+        unsigned char c = (unsigned char)body[i];
+        if (c >= 32) sanitized.concat((char)c);
+    }
+    body = sanitized;
 
     /* Parse JSON */
     JsonDocument doc;
+
     DeserializationError err = deserializeJson(doc, body);
     body = String(); /* free */
 
@@ -456,15 +554,12 @@ bool f1cal_fetchApi() {
         const char* gpTime = sess["gp"] | "";
         if (!gpTime[0]) continue;
 
-        /* Parse ISO 8601 date "YYYY-MM-DDTHH:MM:SSZ" */
-        char rDate[11] = {}, rTime[10] = {};
-        if (strlen(gpTime) >= 20) {
-            memcpy(rDate, gpTime, 10);
-            memcpy(rTime, gpTime + 11, 9); /* includes 'Z' */
-        }
-        time_t gpEpoch = parseUtc(rDate, rTime);
+        /* Parse full ISO 8601.  f1calendar.com times carry local-time
+           offsets (e.g. "2026-03-08T04:00:00+10:00"); f1_parseIsoUtc
+           normalises to UTC so "finished > 6h ago" compares correctly. */
+        long gpEpoch = (long)f1_parseIsoUtc(gpTime);
         if (gpEpoch == 0) continue;
-        if (gpEpoch + 6 * 3600 < now) continue; /* finished > 6h ago */
+        if (gpEpoch + 21600L < now) continue; /* finished > 6h ago */
 
         /* Found the next race! */
         found = true;
@@ -472,8 +567,7 @@ bool f1cal_fetchApi() {
         const char* rLoc  = race["location"] | "";
         int rRound        = race["round"] | 0;
 
-        snprintf(s_nextRace.raceName, sizeof(s_nextRace.raceName),
-                 "%s Grand Prix", rName);
+        raceNameFor(rName, s_nextRace.raceName, sizeof(s_nextRace.raceName));
         strlcpy(s_nextRace.circuitName, rLoc, sizeof(s_nextRace.circuitName));
         strlcpy(s_nextRace.locality,    rLoc, sizeof(s_nextRace.locality));
         s_nextRace.country[0] = '\0'; /* not in this API */
@@ -487,11 +581,13 @@ bool f1cal_fetchApi() {
             if (dt[0]) addSession(sessMap[i].label, dt);
         }
 
-        /* Sort sessions by dateTime (bubble sort, max 7 items) */
+        /* Sort sessions chronologically by their UTC epoch, not by string
+           comparison (mixed "+HH:MM" local offsets sort wrongly). */
         for (int i = 0; i < s_nextRace.sessionCount - 1; i++) {
             for (int j = 0; j < s_nextRace.sessionCount - 1 - i; j++) {
-                if (strcmp(s_nextRace.sessions[j].dateTime,
-                           s_nextRace.sessions[j+1].dateTime) > 0) {
+                time_t a = f1_parseIsoUtc(s_nextRace.sessions[j].dateTime);
+                time_t b = f1_parseIsoUtc(s_nextRace.sessions[j+1].dateTime);
+                if (a != 0 && b != 0 && a > b) {
                     NextRaceSession tmp = s_nextRace.sessions[j];
                     s_nextRace.sessions[j] = s_nextRace.sessions[j+1];
                     s_nextRace.sessions[j+1] = tmp;
@@ -501,34 +597,33 @@ bool f1cal_fetchApi() {
 
         /* Update main calendar state for ramp/sleep logic */
         strlcpy(s_raceName, s_nextRace.raceName, sizeof(s_raceName));
-        strlcpy(s_raceDate, rDate, sizeof(s_raceDate));
+        {   /* UTC date of race day + its midnight — pure arithmetic */
+            int gy; unsigned gmo, gd, gh, gmi, gs;
+            f1_fieldsFromEpoch((time_t)gpEpoch, gy, gmo, gd, gh, gmi, gs);
+            char rDate[11];
+            snprintf(rDate, sizeof(rDate), "%04d-%02u-%02u", gy, gmo, gd);
+            strlcpy(s_raceDate, rDate, sizeof(s_raceDate));
+            s_raceEpoch = f1_epochFromFields(gy, gmo, gd, 0, 0, 0);
+        }
 
-        struct tm raceDayTm;
-        gmtime_r(&gpEpoch, &raceDayTm);
-        raceDayTm.tm_hour = 0; raceDayTm.tm_min = 0; raceDayTm.tm_sec = 0;
-        s_raceEpoch = mktime(&raceDayTm);
-
-        /* firstSessEpoch from first session */
+        /* firstSessEpoch from first (earliest) session */
         if (s_nextRace.sessionCount > 0) {
-            char d[11] = {}, t[10] = {};
-            const char* dt = s_nextRace.sessions[0].dateTime;
-            if (strlen(dt) >= 20) {
-                memcpy(d, dt, 10);
-                memcpy(t, dt + 11, 9);
-            }
-            s_firstSessEpoch = parseUtc(d, t);
+            s_firstSessEpoch =
+                f1_parseIsoUtc(s_nextRace.sessions[0].dateTime);
         }
         s_hasData = true;
 
         Serial.printf("[F1Cal] Next race = %s (Rd %d), %d sessions, on %s\n",
                       s_nextRace.raceName, rRound,
-                      s_nextRace.sessionCount, rDate);
+                      s_nextRace.sessionCount, s_raceDate);
         break;
     }
 
     if (!found) {
         s_apiError = "No upcoming race found";
         s_apiFetching = false;
+        Serial.printf("[F1Cal] No upcoming race found in %u races (now=%ld)\n",
+                      (unsigned)races.size(), now);
         return false;
     }
 

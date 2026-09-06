@@ -13,9 +13,18 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include "F1StringUtils.h"   /* f1_json_str – plain C string scan */
+#include <cstring>
 
 /* Replay engine – for replay_startFromEvents() */
 #include "Replay.h"
+
+/* key:"value" extractor */
+static bool json_str(const char* json, const char* key,
+                     char* out, size_t out_size)
+{
+    return f1_json_str(json, key, out, out_size);
+}
 
 /* mbedtls */
 #include "mbedtls/ssl.h"
@@ -38,6 +47,10 @@
 static constexpr const char* HOST = "livetiming.formula1.com";
 static constexpr const char* PORT_STR = "443";
 static constexpr uint32_t    TIMEOUT_MS = 20000;
+/* Idle tolerance while streaming a response body – generous: some of
+   these endpoints dribble data slowly and a 20 s quiet spell (e.g. the
+   monitor waking from modem sleep) otherwise truncates large payloads. */
+static constexpr uint32_t    READ_IDLE_MS = 45000;
 
 /* ── Cached result ────────────────────────────────────────────────────── */
 static String  s_json;
@@ -45,7 +58,7 @@ static bool    s_hasData  = false;
 static volatile bool s_fetching = false;
 static volatile bool s_fetchRequested = false;
 static int     s_retries  = 0;
-static constexpr int MAX_RETRIES = 3;
+static constexpr int MAX_RETRIES = 6;
 static String  s_lastError;   /* diagnostic – readable via API */
 
 /* ── BIO callbacks for mbedtls ←→ lwIP socket ────────────────────────── */
@@ -257,20 +270,269 @@ static bool tls_write_all(TlsConn& c, const char* data, size_t len)
 static String tls_read_all(TlsConn& c)
 {
     String out;
-    out.reserve(8192);
-    unsigned long t0 = millis();
-    while (millis() - t0 < TIMEOUT_MS) {
-        unsigned char buf[512];
+    out.reserve(16384);
+    unsigned long lastData = millis();
+    while (millis() - lastData < READ_IDLE_MS) {
+        unsigned char buf[1024];
         int r = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
         if (r > 0) {
             out.concat((const char*)buf, (unsigned int)r);
-            t0 = millis();  /* reset timeout on data */
+            lastData = millis();  /* reset idle timer on data */
+            continue;
+        }
+        if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;  /* orderly close */
+        }
+        if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            delay(1);
+            continue;
+        }
+        /* Real TLS error.  Some servers drop the TCP connection without a
+           close_notify once the body is sent, which mbedTLS reports as an
+           error even though the payload is complete (or nearly so).  Try
+           once more after a short pause; if it fails again, keep whatever
+           we received. */
+        Serial.printf("[F1Sess] TLS read error 0x%x after %u bytes\n",
+                      -r, (unsigned)out.length());
+        delay(30);
+        int r2 = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
+        if (r2 > 0) {
+            out.concat((const char*)buf, (unsigned int)r2);
+            lastData = millis();
+            continue;
+        }
+        break;
+    }
+    Serial.printf("[F1Sess] read done: %u bytes\n", (unsigned)out.length());
+    return out;
+}
+
+/* ── Lightweight Index.json trimmers (no ArduinoJson on the big doc) ── */
+
+/* Minimal JSON string escaper for values we echo into the output */
+static String jsonEsc(const char* s)
+{
+    String o;
+    for (const char* p = s; p && *p; ++p) {
+        if (*p == '"')      o += "\\\"";
+        else if (*p == '\\') o += "\\\\";
+        else                o += *p;
+    }
+    return o;
+}
+
+/* Skip one JSON array starting at '['; returns pointer past its ']' or
+   nullptr when unbalanced.  Handles strings and escapes. */
+static const char* skipJsonArray(const char* open)
+{
+    if (!open || *open != '[') return nullptr;
+    int depth = 0;
+    bool in = false, esc = false;
+    for (const char* q = open; *q; ++q) {
+        char c = *q;
+        if (in) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in = false;
+            continue;
+        }
+        if (c == '"') in = true;
+        else if (c == '[') ++depth;
+        else if (c == ']') { if (--depth == 0) return q + 1; }
+    }
+    return nullptr;
+}
+
+/* Skip one JSON object starting at '{'; returns pointer past its '}' or
+   nullptr when unbalanced. */
+static const char* skipJsonObject(const char* open)
+{
+    if (!open || *open != '{') return nullptr;
+    int depth = 0;
+    bool in = false, esc = false;
+    for (const char* q = open; *q; ++q) {
+        char c = *q;
+        if (in) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in = false;
+            continue;
+        }
+        if (c == '"') in = true;
+        else if (c == '{') ++depth;
+        else if (c == '}') { if (--depth == 0) return q + 1; }
+    }
+    return nullptr;
+}
+
+/* Trim raw Index.json into {"meetings":[{name,location,code,sessions:
+   [{name,type,date,path}]}]}.  Returns "" on failure. */
+static String f1sessions_trimIndex(const String& body)
+{
+    String out;
+    out.reserve(16384);
+
+    const char* ma = strstr(body.c_str(), "\"Meetings\"");
+    if (!ma) return String();
+    ma = strchr(ma, '[');
+    if (!ma) return String();
+    const char* meetEnd = skipJsonArray(ma);
+    if (!meetEnd) return String();
+
+    int meetingCount = 0;
+    out = "{\"meetings\":[";
+    const char* cur = ma + 1;
+    while (cur && cur < meetEnd) {
+        const char* mo = strchr(cur, '{');
+        if (!mo || mo >= meetEnd) break;
+        const char* moEnd = skipJsonObject(mo);
+        if (!moEnd || moEnd > meetEnd) break;
+
+        String ms;
+        ms.concat(mo, (unsigned)(moEnd - mo));
+
+        /* Inside a meeting, "Sessions" comes FIRST, followed by the
+           meeting fields (Code/Location/Name/Country/...).  Locate the
+           sessions array so we can (a) bound the session walk and
+           (b) start field extraction AFTER it. */
+        const char* sa = strstr(ms.c_str(), "\"Sessions\"");
+        const char* sessEnd = nullptr;
+        if (sa) {
+            const char* saOpen = strchr(sa, '[');
+            sessEnd = saOpen ? skipJsonArray(saOpen) : nullptr;
+        }
+        const char* fFrom = sessEnd ? sessEnd : ms.c_str();
+
+        char name[96] = {}, loc[96] = {}, code[32] = {};
+        json_str(fFrom, "Name", name, sizeof(name));
+        json_str(fFrom, "Location", loc, sizeof(loc));
+        json_str(fFrom, "Code", code, sizeof(code));
+
+        if (meetingCount) out += ",";
+        out += "{\"name\":\"" + jsonEsc(name)
+             + "\",\"location\":\"" + jsonEsc(loc)
+             + "\",\"code\":\"" + jsonEsc(code)
+             + "\",\"sessions\":[";
+
+        int sessCount = 0;
+        if (sa && sessEnd) {
+            const char* sc = sa + 1;
+            while (sc && sc < sessEnd) {
+                const char* so = strchr(sc, '{');
+                if (!so || so >= sessEnd) break;
+                const char* soEnd = skipJsonObject(so);
+                if (!soEnd || soEnd > sessEnd) break;
+                String ss;
+                ss.concat(so, (unsigned)(soEnd - so));
+
+                char sName[80] = {}, sType[32] = {};
+                char sDate[28] = {}, sPath[140] = {};
+                json_str(ss.c_str(), "Name", sName, sizeof(sName));
+                json_str(ss.c_str(), "Type", sType, sizeof(sType));
+                json_str(ss.c_str(), "StartDate", sDate, sizeof(sDate));
+                json_str(ss.c_str(), "Path", sPath, sizeof(sPath));
+
+                /* "2026-03-06T12:30:00" -> "2026-03-06 12:30" */
+                String date;
+                for (const char* d = sDate; *d && d - sDate < 16; ++d)
+                    date += (*d == 'T') ? ' ' : *d;
+
+                if (sessCount) out += ",";
+                out += "{\"name\":\"" + jsonEsc(sName)
+                     + "\",\"type\":\"" + jsonEsc(sType)
+                     + "\",\"date\":\"" + jsonEsc(date.c_str()) + "\"";
+                if (sPath[0]) out += ",\"path\":\"" + jsonEsc(sPath) + "\"";
+                out += "}";
+                ++sessCount;
+                sc = soEnd;
+            }
+        }
+        out += "]}";
+        ++meetingCount;
+        cur = moEnd;
+    }
+    out += "]}";
+    if (meetingCount == 0) return String();
+    return out;
+}
+
+/* HTTP response reader that honours Content-Length.
+   The plain read-all-until-close loop truncated large responses from
+   livetiming (the server occasionally closes early / dribbles data),
+   which produced half-parsed indexes.  Here we read the headers first,
+   then keep reading until exactly Content-Length bytes of body have
+   arrived (or the peer closes / idles out). */
+static String tls_read_http(TlsConn& c)
+{
+    String out;
+    out.reserve(20000);
+    unsigned char buf[1024];
+    unsigned long last = millis();
+
+    /* Phase 1 – headers */
+    int hdrEnd = -1;
+    while (millis() - last < READ_IDLE_MS) {
+        int r = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
+        if (r > 0) {
+            out.concat((const char*)buf, (unsigned int)r);
+            last = millis();
+            hdrEnd = out.indexOf("\r\n\r\n");
+            if (hdrEnd >= 0) break;
         } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-            break;  /* connection closed */
-        } else if (r == MBEDTLS_ERR_SSL_WANT_READ) {
+            break;
+        } else if (r == MBEDTLS_ERR_SSL_WANT_READ
+                || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             delay(1);
         } else {
-            break;  /* error */
+            break;
+        }
+    }
+    if (hdrEnd < 0) return out;   /* incomplete headers */
+
+    String hdrs = out.substring(0, hdrEnd);
+
+    /* Content-Length (absent / 0 / chunked => read until close) */
+    long want = -1;
+    int cl = hdrs.indexOf("Content-Length:");
+    if (cl >= 0 && hdrs.indexOf("chunked") < 0) {
+        const char* p = hdrs.c_str() + cl + 15;
+        while (*p == ' ') ++p;
+        want = 0;
+        while (*p >= '0' && *p <= '9') { want = want * 10 + (*p - '0'); ++p; }
+    }
+
+    if (want > 0) {
+        long have = (long)out.length() - (hdrEnd + 4);
+        while (have < want && millis() - last < READ_IDLE_MS) {
+            int r = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
+            if (r > 0) {
+                out.concat((const char*)buf, (unsigned int)r);
+                have += r;
+                last = millis();
+            } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                break;
+            } else if (r == MBEDTLS_ERR_SSL_WANT_READ
+                    || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                delay(1);
+            } else {
+                break;
+            }
+        }
+    } else {
+        /* No length given – read until the peer closes */
+        while (millis() - last < READ_IDLE_MS) {
+            int r = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
+            if (r > 0) {
+                out.concat((const char*)buf, (unsigned int)r);
+                last = millis();
+            } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                break;
+            } else if (r == MBEDTLS_ERR_SSL_WANT_READ
+                    || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                delay(1);
+            } else {
+                break;
+            }
         }
     }
     return out;
@@ -278,164 +540,149 @@ static String tls_read_all(TlsConn& c)
 
 /* ── Public API ───────────────────────────────────────────────────────── */
 
+/* ── f1sessions_fetch ─────────────────────────────────────────────────────
+ * Fetches the season session list from the f1calendar CDN feed
+ * (sportstimes/f1 – same source the race-calendar card uses).
+ *
+ * Why not livetiming /static/{year}/Index.json any more: that 19 kB
+ * response is intermittently truncated by the timing server on this
+ * device (~16 kB TLS-record boundaries), giving half-parsed lists that
+ * show only some sessions (e.g. just "Race" and "FP1").  The CDN feed
+ * is ~10 kB, single-TLS-record, and has fetched 100% reliably.
+ *
+ * Feed shape:  {"races":[{name,location,round,sessions:{fp1,fp2,fp3,
+ *   sprintQualifying,sprint,qualifying,gp: "YYYY-MM-DDTHH:MM:SSZ"}}]}
+ * Trimmed to the same shape the Sessions page expects:
+ *   {"meetings":[{name,location,code,sessions:[{name,type,date}]}]}
+ */
+static String f1sessions_fetchCalendar(const char* path, const char* host)
+{
+    String err;
+    String body = f1sessions_httpsGet(path, err, host);
+    if (body.length() == 0) {
+        s_lastError = err.length() ? err : "HTTP fetch failed";
+        Serial.println("[F1Sess] " + s_lastError);
+        return String();
+    }
+
+    /* BOM / control sanitising already handled by f1sessions_httpsGet */
+
+    JsonDocument doc;
+    DeserializationError derr = deserializeJson(doc, body);
+    if (derr) {
+        s_lastError = "JSON: " + String(derr.c_str());
+        Serial.println("[F1Sess] " + s_lastError);
+        return String();
+    }
+    body = String();
+
+    JsonArray races = doc["races"];
+    if (races.isNull() || races.size() == 0) {
+        s_lastError = "No races in calendar feed";
+        return String();
+    }
+
+    struct K { const char* key; const char* label; const char* type; };
+    static const K KMAP[] = {
+        {"fp1", "FP1", "Practice"},
+        {"fp2", "FP2", "Practice"},
+        {"fp3", "FP3", "Practice"},
+        {"sprintQualifying", "Sprint Qualifying", "Sprint"},
+        {"sprint", "Sprint", "Sprint"},
+        {"qualifying", "Qualifying", "Qualifying"},
+        {"gp",   "Race",   "Race"},
+        {nullptr, nullptr, nullptr}
+    };
+
+    JsonDocument out;
+    JsonArray meetings = out["meetings"].to<JsonArray>();
+    for (JsonObject race : races) {
+        JsonObject sess = race["sessions"];
+        if (sess.isNull()) continue;
+
+        String rname = race["name"] | "";
+        if (rname.length() == 0) continue;
+        /* Append " Grand Prix" when the feed name lacks it */
+        String end6 = rname.substring(rname.length() > 6 ? rname.length() - 6 : 0);
+        if (!end6.endsWith("Prix") && !rname.endsWith("GP")) rname += " Grand Prix";
+
+        JsonObject mo = meetings.add<JsonObject>();
+        mo["name"]     = rname;
+        mo["location"] = race["location"] | "";
+        mo["code"]     = String(race["round"] | 0);
+
+        JsonArray msess = mo["sessions"].to<JsonArray>();
+        for (int k = 0; KMAP[k].key; ++k) {
+            const char* dt = sess[KMAP[k].key] | "";
+            if (!dt[0]) continue;
+            JsonObject so = msess.add<JsonObject>();
+            so["name"] = KMAP[k].label;
+            so["type"] = KMAP[k].type;
+            /* "2026-09-06T13:00:00Z" -> "2026-09-06 13:00" */
+            String date(dt);
+            if (date.endsWith("Z")) date = date.substring(0, date.length() - 1);
+            date.replace("T", " ");
+            if (date.length() > 16) date = date.substring(0, 16);
+            so["date"] = date;
+        }
+        /* (sessions without any mapped slot are simply left empty) */
+    }
+
+    /* Feed is ordered by round (chronological); the page lists meetings
+       in the order returned, newest-capable first when reversed by JS. */
+    s_json = String();
+    serializeJson(out, s_json);
+    int mcnt = 0;
+    for (const char* q = s_json.c_str(); (q = strstr(q, "\"location\":")) != nullptr; ++q)
+        ++mcnt;
+    Serial.printf("[F1Sess] Calendar list cached: %u bytes, %d meetings\n",
+                  s_json.length(), mcnt);
+    return s_json;
+}
+
 bool f1sessions_fetch(int year)
 {
     s_fetchRequested = false;
     s_fetching = true;
     s_retries++;
     s_lastError = "";
-    Serial.printf("[F1Sess] Fetching %d/Index.json (attempt %d/%d) heap=%u\n",
-                  year, s_retries, MAX_RETRIES, ESP.getFreeHeap());
+    Serial.printf("[F1Sess] Fetching calendar list (attempt %d/%d) heap=%u\n",
+                  s_retries, MAX_RETRIES, ESP.getFreeHeap());
 
-    /* Heap-allocate TlsConn – the struct is ~3KB (entropy_context alone
-       is ~1.6KB) and stack space is precious on FreeRTOS tasks. */
-    TlsConn* cp = new (std::nothrow) TlsConn;
-    if (!cp) {
-        s_lastError = "OOM: TlsConn alloc";
-        s_fetching = false;
-        return false;
-    }
-
-    /* Use a lambda-style cleanup so every exit path frees the heap block */
-    #define FAIL_RET(msg) do { s_lastError = (msg); \
-        Serial.println("[F1Sess] " + s_lastError); \
-        tls_cleanup(*cp); delete cp; s_fetching = false; return false; } while(0)
-
-    if (!tls_connect(*cp, HOST, PORT_STR)) {
-        Serial.println("[F1Sess] FAIL: " + s_lastError);
-        delete cp;   /* tls_connect already cleaned up internals */
-        s_fetching = false;
-        return false;
-    }
-
-    /* Send HTTP GET */
-    char path[64];
-    snprintf(path, sizeof(path), "/static/%d/Index.json", year);
-
-    String req = String("GET ") + path + " HTTP/1.1\r\n"
-               + "Host: " + HOST + "\r\n"
-               + "Accept: application/json\r\n"
-               + "Connection: close\r\n\r\n";
-
-    if (!tls_write_all(*cp, req.c_str(), req.length())) {
-        FAIL_RET("Write failed");
-    }
-
-    /* Read entire response (Connection: close) */
-    String raw = tls_read_all(*cp);
-    tls_cleanup(*cp);
-    delete cp;
-    cp = nullptr;
-
-    if (raw.length() == 0) {
-        s_lastError = "Empty response (0 bytes)";
-        s_fetching = false;
-        return false;
-    }
-
-    /* Split headers from body */
-    int bodyStart = raw.indexOf("\r\n\r\n");
-    if (bodyStart < 0) {
-        s_lastError = "No header/body separator";
-        s_fetching = false;
-        return false;
-    }
-    String headers = raw.substring(0, bodyStart);
-    String body = raw.substring(bodyStart + 4);
-    int rawLen = raw.length();
-    raw = String();  /* free */
-
-    Serial.printf("[F1Sess] rawLen=%d bodyLen=%d\n", rawLen, (int)body.length());
-
-    if (headers.indexOf("200") < 0) {
-        s_lastError = "HTTP: " + headers.substring(0, 60);
-        s_fetching = false;
-        return false;
-    }
-
-    if (body.length() < 10) {
-        s_lastError = "Body too short: " + String(body.length()) + "b";
-        s_fetching = false;
-        return false;
-    }
-
-    /* Handle chunked transfer-encoding: dechunk manually */
-    if (headers.indexOf("chunked") >= 0) {
-        String dechunked;
-        dechunked.reserve(body.length());
-        int pos = 0;
-        while (pos < (int)body.length()) {
-            int nl = body.indexOf("\r\n", pos);
-            if (nl < 0) break;
-            String hexLen = body.substring(pos, nl);
-            hexLen.trim();
-            unsigned long chunkLen = strtoul(hexLen.c_str(), nullptr, 16);
-            if (chunkLen == 0) break;  /* final chunk */
-            int dataStart = nl + 2;
-            if (dataStart + (int)chunkLen > (int)body.length()) break;
-            dechunked.concat(body.c_str() + dataStart, (unsigned int)chunkLen);
-            pos = dataStart + (int)chunkLen + 2; /* skip chunk data + \r\n */
-        }
-        body = dechunked;
-    }
-
-    /* Strip UTF-8 BOM if present */
-    if (body.length() >= 3 &&
-        (unsigned char)body[0] == 0xEF &&
-        (unsigned char)body[1] == 0xBB &&
-        (unsigned char)body[2] == 0xBF) {
-        body = body.substring(3);
-    }
-
-    /* Parse and trim to a compact JSON for the WebUI */
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-        s_lastError = "JSON parse: " + String(err.c_str())
-                    + " bodyLen=" + String(body.length());
-        Serial.println("[F1Sess] " + s_lastError);
-        s_fetching = false;
-        return false;
-    }
-    body = String();  /* free raw body now */
-
-    /* Build trimmed output: array of meetings with sessions */
-    JsonDocument out;
-    JsonArray meetings = out["meetings"].to<JsonArray>();
-
-    for (JsonObject m : doc["Meetings"].as<JsonArray>()) {
-        JsonObject mo = meetings.add<JsonObject>();
-        mo["name"]     = m["Name"];
-        mo["location"] = m["Location"];
-        mo["code"]     = m["Code"];
-
-        JsonArray sess = mo["sessions"].to<JsonArray>();
-        for (JsonObject s : m["Sessions"].as<JsonArray>()) {
-            JsonObject so = sess.add<JsonObject>();
-            so["name"] = s["Name"];
-            so["type"] = s["Type"];
-            /* StartDate: "2026-03-06T12:30:00" → "2026-03-06 12:30" */
-            String sd = s["StartDate"] | "";
-            sd.replace("T", " ");
-            if (sd.length() > 16) sd = sd.substring(0, 16);
-            so["date"] = sd;
-            /* Path present only for sessions with available data */
-            const char* path = s["Path"] | "";
-            if (path[0]) so["path"] = path;
+    static const struct { const char* host; const char* fmt; } MIRR[] = {
+        { "cdn.jsdelivr.net",          "/gh/sportstimes/f1@main/_db/f1/%d.json" },
+        { "raw.githubusercontent.com", "/sportstimes/f1/main/_db/f1/%d.json" },
+    };
+    for (unsigned m = 0; m < 2; m++) {
+        char path[96];
+        snprintf(path, sizeof(path), MIRR[m].fmt, year);
+        s_lastError = "";
+        Serial.printf("[F1Sess] Trying %s%s\n", MIRR[m].host, path);
+        if (f1sessions_fetchCalendar(path, MIRR[m].host).length() > 0) {
+            s_hasData = true;
+            s_fetching = false;
+            return true;
         }
     }
-
-    s_json = String();
-    serializeJson(out, s_json);
-    s_hasData = true;
     s_fetching = false;
-    #undef FAIL_RET
-    Serial.printf("[F1Sess] Cached %u bytes, %d meetings\n",
-                  s_json.length(), meetings.size());
-    return true;
+    return false;
 }
 
-/* ── Generic HTTPS GET helper (reusable by other modules) ─────────── */
+/* ── Async fetch request (picked up by the f1net task) ────────────────── */
+void f1sessions_requestFetch(int year)
+{
+    if (s_fetching || s_hasData || s_fetchRequested) return;
+    /* A fresh request (web UI button, boot) resets the failure counter so
+       a transient network problem does not leave /api/sessions loading
+       forever. */
+    s_retries = 0;
+    s_fetchRequested = true;
+    Serial.printf("[F1Sess] Fetch requested (year %d)\n", year);
+}
+
+const String& f1sessions_lastError() { return s_lastError; }
+
+void f1sessions_resetRetries() { s_retries = 0; s_lastError = ""; }
 
 String f1sessions_httpsGet(const char* path, String& outError,
                           const char* host, const char* port)
@@ -520,18 +767,6 @@ void f1sessions_clear() {
 }
 
 /* ── Async fetch request (picked up by the f1net task) ────────────────── */
-void f1sessions_requestFetch(int year)
-{
-    if (s_fetching || s_hasData || s_fetchRequested) return;
-    if (s_retries >= MAX_RETRIES) return;   /* give up after N failures */
-    s_fetchRequested = true;
-    Serial.printf("[F1Sess] Fetch requested (year %d)\n", year);
-}
-
-const String& f1sessions_lastError() { return s_lastError; }
-
-void f1sessions_resetRetries() { s_retries = 0; s_lastError = ""; }
-
 /* ═════════════════════════════════════════════════════════════════════════
    Session Replay – fetch .jsonStream files, parse events, start replay
    ═════════════════════════════════════════════════════════════════════════ */

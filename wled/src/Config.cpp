@@ -23,6 +23,9 @@ void cfg_defaults() {
     g_cfg.feat_drs          = false;  /* fires frequently in practice – off by default */
     g_cfg.feat_start_lights = true;
     g_cfg.deep_sleep        = false;  /* opt-in – off by default                        */
+    g_cfg.react_track       = true;   /* TrackStatus codes                             */
+    g_cfg.react_global      = true;   /* global RC: red flag / SC / VSC / chequered    */
+    g_cfg.react_sector      = false;  /* sector-local RC yellow notes                  */
 
     /* StateEffect fields: {effect, r, g, b, speed, r2, g2, b2, revert_s}
      *
@@ -93,6 +96,9 @@ void cfg_load() {
     g_cfg.feat_drs          = doc["feat_drs"]          | false;
     g_cfg.feat_start_lights = doc["feat_start_lights"] | true;
     g_cfg.deep_sleep        = doc["deep_sleep"]        | false;
+    g_cfg.react_track       = doc["react_track"]       | true;
+    g_cfg.react_global      = doc["react_global"]      | true;
+    g_cfg.react_sector      = doc["react_sector"]      | false;
     g_cfg.delay_s           = doc["delay_s"]           | 40;
 
     JsonArray arr = doc["states"].as<JsonArray>();
@@ -130,6 +136,9 @@ void cfg_save() {
     doc["feat_drs"]          = g_cfg.feat_drs;
     doc["feat_start_lights"] = g_cfg.feat_start_lights;
     doc["deep_sleep"]        = g_cfg.deep_sleep;
+    doc["react_track"]       = g_cfg.react_track;
+    doc["react_global"]      = g_cfg.react_global;
+    doc["react_sector"]      = g_cfg.react_sector;
     doc["delay_s"]           = g_cfg.delay_s;
 
     JsonArray arr = doc["states"].to<JsonArray>();

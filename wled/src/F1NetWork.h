@@ -49,6 +49,16 @@ typedef enum {
 typedef void (*F1EventCB)(F1Event ev);
 void f1net_setEventCallback(F1EventCB cb);
 
+/*
+ * Callback fired once per fresh (re)connect right when the initial type:3
+ * snapshot has been received but before its state is processed.
+ * Lets the consumer drop any stale, not-yet-applied queued states so that
+ * only the CURRENT on-track state is applied after a boot/reconnect –
+ * never a replay of older events.  Runs on the f1net FreeRTOS task.
+ */
+typedef void (*F1SnapshotCB)(void);
+void f1net_setSnapshotCallback(F1SnapshotCB cb);
+
 /* Initialise – call once from WLED setup()  */
 void f1net_setup(void);
 
@@ -56,11 +66,16 @@ void f1net_setup(void);
 void f1net_loop(void);
 
 /* Query connection state */
-bool       f1net_isConnected(void);
-F1NetState f1net_getState(void);
+bool        f1net_isConnected(void);
+F1NetState  f1net_getState(void);
+/* Current connect phase: "wifi","cal","sess","wait","connecting","live" */
+const char* f1net_connectPhase(void);
+/* Most recent connection failure reason ("" if none / last attempt succeeded) */
+const char* f1net_lastError(void);
 
 /* Disconnect and reset (called when usermod is disabled) */
 void f1net_disconnect(void);
+void f1net_forceReconnect(void);  /* reset back-off and reconnect immediately */
 
 /* ── Live event log (ring buffer of recent session events) ──────────── */
 #define F1_EVENT_LOG_MAX  40

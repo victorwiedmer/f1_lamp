@@ -22,6 +22,8 @@
 #include "WebUI.h"
 #include "F1NetWork.h"
 #include "F1Calendar.h"
+#include "F1TimeUtils.h"   /* f1_clock() – clean 32-bit wall clock */
+#include "F1Sessions.h"    /* f1sessions_requestFetch – session index */
 #include "Replay.h"
 
 /* ── AP mode credentials ────────────────────────────────────────────────── */
@@ -74,6 +76,16 @@ static void applyState(F1NetState newState) {
 static void onF1StateChange(F1NetState newState) {
     if (replay_isActive() || replay_isLoading()) return;  /* replay has the floor */
     applyState(newState);
+}
+
+/* Fired once per (re)connect right when the initial SignalR snapshot is
+ * parsed.  Drop any stale queued states so that after a boot/reconnect
+ * only the CURRENT on-track state is applied - never a replay of events
+ * that happened while we were disconnected.  Runs on the f1net task;
+ * g_sqTail is a single volatile byte, safe to touch from here. */
+static void onSnapshotFlushQueue() {
+    if (replay_isActive() || replay_isLoading()) return;
+    g_sqTail = g_sqHead;
 }
 
 /* ── Pending flash event (written by f1net task, consumed in loop()) ─────── */
@@ -195,6 +207,8 @@ void setup() {
 
     /* 1. Load config from LittleFS */
     cfg_init();
+    LOGF("[F1Lamp] Config: ssid=\"%s\" deep_sleep=%d power=%d leds=%d\n",
+         g_cfg.ssid, (int)g_cfg.deep_sleep, (int)g_cfg.power, (int)g_cfg.led_count);
 
     /* ── EARLY DEEP-SLEEP CHECK ─────────────────────────────────────────
      *  When deep_sleep is enabled, do a MINIMAL boot: STA-only WiFi (no AP,
@@ -222,14 +236,14 @@ void setup() {
             /* Quick NTP sync */
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
             uint32_t ntpT0 = millis();
-            while (time(nullptr) < 1577836800UL && millis() - ntpT0 < 8000) {
+            while (f1_clock() < (time_t)1577836800UL && millis() - ntpT0 < 8000) {
                 delay(50);
             }
         }
 
-        bool haveTime = (time(nullptr) > 1577836800UL);
+        bool haveTime = (f1_clock() > (time_t)1577836800UL);
         if (haveTime) {
-            Serial.printf("[Sleep] Time: %lu\n", (unsigned long)time(nullptr));
+            Serial.printf("[Sleep] Time: %lu\n", (unsigned long)f1_clock());
             f1cal_update();   /* refresh built-in calendar with current time */
 
             if (!f1cal_weekendActive()) {
@@ -345,47 +359,55 @@ void setup() {
 
     /* 7. Start F1 live-timing in a dedicated FreeRTOS task so blocking
           DNS / TCP calls in negotiate() never stall the lwIP thread or
-          prevent the web server from accepting browser connections.         */
-    if (sta) {
-        f1net_setCallback(onF1StateChange);
-        f1net_setEventCallback(onF1Event);
-        replay_setCallbacks(applyState, onF1Event);
-        f1net_setup();
-        static TaskHandle_t s_f1netTask = nullptr;
-        xTaskCreate(
-            [](void*) {
-                uint32_t loopCnt = 0;
-                for (;;) {
-                    f1net_loop();
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    /* Log stack high-water mark every ~60s */
-                    if (++loopCnt % 6000 == 0) {
-                        UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
-                        Serial.printf("[f1net] stack HWM=%u words (%u bytes free)\n",
-                                      hwm, hwm * sizeof(StackType_t));
-                    }
+          prevent the web server from accepting browser connections.
+          Create the task UNCONDITIONALLY, even if STA failed on boot:
+          f1net_loop() already returns early when WiFi isn't connected, so
+          this is safe, and the task is already alive by the time the WiFi
+          watchdog reconnects.                                               */
+    f1net_setCallback(onF1StateChange);
+    f1net_setEventCallback(onF1Event);
+    f1net_setSnapshotCallback(onSnapshotFlushQueue);
+    replay_setCallbacks(applyState, onF1Event);
+    f1net_setup();
+    static TaskHandle_t s_f1netTask = nullptr;
+    xTaskCreate(
+        [](void*) {
+            uint32_t loopCnt = 0;
+            uint32_t lastPrint = 0;
+            for (;;) {
+                f1net_loop();
+                vTaskDelay(pdMS_TO_TICKS(10));
+                /* Log connection phase + stack high-water mark every ~60s */
+                if (millis() - lastPrint > 60000) {
+                    lastPrint = millis();
+                    UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
+                    Serial.printf("[f1net] phase=%s wifi=%d stackHWM=%u words (%u B free)\n",
+                                  f1net_connectPhase(), WiFi.status(),
+                                  hwm, hwm * sizeof(StackType_t));
                 }
-            },
-            "f1net",   /* task name  */
-            20480,     /* stack (bytes) – TlsConn is heap-allocated; 20 KB enough */
-            nullptr,
-            1,         /* priority 1 (idle+1) – below loop() at priority 1? */
-            &s_f1netTask
-        );
-        Serial.println("[F1Lamp] F1 network task started");
-        LOG("[F1Lamp] F1 network task started\n");
-    }
+            }
+        },
+        "f1net",   /* task name  */
+        32768,     /* stack (bytes) – raised: index/calendar fetch paths build
+                      large Strings; 20 KB let the stack overflow into the
+                      heap and corrupt String metadata (random crashes). */
+        nullptr,
+        1,         /* priority 1 (idle+1) – below loop() at priority 1? */
+        &s_f1netTask
+    );
+    Serial.println("[F1Lamp] F1 network task started");
+    LOG("[F1Lamp] F1 network task started\n");
 
     /* 8. Set final effect */
     if (sta) {
         /* 8a. NTP time sync */
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         uint32_t ntpT0 = millis();
-        while (time(nullptr) < 1577836800UL && millis() - ntpT0 < 10000) {
+        while (f1_clock() < (time_t)1577836800UL && millis() - ntpT0 < 10000) {
             ledfx_tick(); delay(100);
         }
-        if (time(nullptr) > 1577836800UL) {
-            Serial.printf("[NTP] Synced: %lu\n", (unsigned long)time(nullptr));
+        if (f1_clock() > (time_t)1577836800UL) {
+            Serial.printf("[NTP] Synced: %lu\n", (unsigned long)f1_clock());
             f1cal_update();
             /* Request API fetch for full session schedule (runs in f1net task) */
             f1cal_requestApiFetch();
@@ -431,7 +453,7 @@ void loop() {
         static uint32_t s_sleepCheckMs = 0;
         if (millis() - s_sleepCheckMs > 60000) {   /* check every 60 s */
             s_sleepCheckMs = millis();
-            if (time(nullptr) > 1577836800UL) {
+            if (f1_clock() > (time_t)1577836800UL) {
                 f1cal_update();
                 if (!f1cal_weekendActive()) {
                     uint32_t secs = f1cal_sleepSeconds();
@@ -449,9 +471,14 @@ void loop() {
         }
     }
 
-    /* ── WiFi watchdog: reconnect every 30 s if STA drops ───────────── */
+    /* ── WiFi watchdog: reconnect every 30 s if STA drops ───────────── *
+     *  Runs whenever an SSID is configured, EVEN in AP-only mode when
+     *  STA failed at boot.  Previously gated on !g_apMode, which meant
+     *  a boot-time STA failure set g_apMode=true and disabled this
+     *  watchdog forever — the device could never re-join WiFi and reach
+     *  F1 again without a reboot.                                          */
     static uint32_t wifiRetryMs = 0;
-    if (!g_apMode && WiFi.status() != WL_CONNECTED) {
+    if (g_cfg.ssid[0] != '\0' && WiFi.status() != WL_CONNECTED) {
         if (millis() - wifiRetryMs > 30000) {
             wifiRetryMs = millis();
             Serial.println("[WiFi] Reconnecting…");

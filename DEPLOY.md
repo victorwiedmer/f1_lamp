@@ -1,455 +1,177 @@
-# F1 Lamp — Deployment Guide (Windows)
+# F1 Lamp — Deploy & Operations
 
-Everything you need to go from zero to a flashed ESP32-C3, step by step.
+Standalone ESP32-C3 firmware (PlatformIO) that drives a WS2812B LED strip
+(data on `LED_PIN`, default GPIO 2) to visualise live Formula 1 session
+state. It subscribes to the F1 live-timing feed
+(`livetiming.formula1.com`, SignalR Core over WSS), turns the LEDs into the
+current flag/session state, and ships a small web UI + REST API served from
+LittleFS.
 
----
-
-## Table of contents
-
-1. [Prerequisites](#1-prerequisites)
-2. [One-time setup](#2-one-time-setup)
-3. [Clone & prepare WLED](#3-clone--prepare-wled)
-4. [Copy the F1Lamp usermod](#4-copy-the-f1lamp-usermod)
-5. [Patch WLED's usermod registration file](#5-patch-wleds-usermod-registration-file)
-6. [Build the firmware](#6-build-the-firmware)
-7. [Flash to the ESP32-C3](#7-flash-to-the-esp32-c3)
-8. [First boot & WiFi setup](#8-first-boot--wifi-setup)
-9. [Testing without a live race](#9-testing-without-a-live-race)
-10. [Serial monitor (debug logs)](#10-serial-monitor-debug-logs)
-11. [Updating after code changes](#11-updating-after-code-changes)
-12. [Troubleshooting](#12-troubleshooting)
+> The `wled/` folder name is a historical artefact — this is **not** WLED.
+> See `README.md` for the user-facing feature set; `CLAUDE.md` for
+> architecture notes that must stay true.
 
 ---
 
-## 1. Prerequisites
+## Repository layout
 
-Install each tool below **in order**. All are free.
-
-### 1.1 Git
-Download and install from https://git-scm.com/download/win  
-During install: accept all defaults (tick "Git Bash", leave PATH option as "Git from the command line and also from 3rd-party software").
-
-Verify:
-```powershell
-git --version
-# should print: git version 2.x.x
-```
-
-### 1.2 Python 3.x
-Download from https://python.org/downloads  
-**Critical:** on the first installer screen, tick **"Add Python to PATH"** before clicking Install.
-
-Verify:
-```powershell
-python --version
-# should print: Python 3.x.x
-```
-
-### 1.3 PlatformIO CLI
-PlatformIO is the build system used to compile WLED. Install it using pip:
-
-```powershell
-pip install platformio
-# Wait — this downloads ~50 MB of toolchains on first use
-```
-
-Verify:
-```powershell
-pio --version
-# should print: PlatformIO Core, version 6.x.x
-```
-
-> **Alternative:** if you prefer a GUI, install [VS Code](https://code.visualstudio.com/) and the
-> [PlatformIO IDE extension](https://marketplace.visualstudio.com/items?itemName=platformio.platformio-ide).
-> The steps below show CLI commands, but every command has an equivalent button in the VS Code PlatformIO sidebar.
-
-### 1.4 USB driver for your ESP32-C3 board
-The driver depends on which USB-to-serial chip your specific board uses.
-Check the underside of the board for the chip marking:
-
-| Chip on board | Driver download |
+| Path | What it is |
 |---|---|
-| **CP2102** / CP2104 | https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers |
-| **CH340** / CH341 | https://www.wch-ic.com/downloads/CH341SER_EXE.html |
-| **No external chip** (USB direct, marked "USB" near the port) | Built-in on Windows 10/11 — no driver needed |
+| `wled/` | PlatformIO project (firmware `src/`, web UI `data/`) |
+| `mbedtls/` | **git submodule** → upstream mbedTLS pinned at `v2.28.8` (the SDK ships TLS compiled out; a few `mbedtls/library/*.c` are recompiled into the firmware — see `wled/src/mbedtls_*.c` wrappers and `mbedtls_ssl_enable.h`) |
+| `.gitmodules` | submodule registration |
 
-After installing, plug in the ESP32-C3. Open **Device Manager** → expand **Ports (COM & LPT)**. You should see a new entry like `Silicon Labs CP210x (COM3)`. Note your COM port number.
+### First clone
 
----
-
-## 2. One-time setup
-
-Open **PowerShell** (search "PowerShell" in the Start menu — no need to run as Admin).
-
-```powershell
-# Allow running local scripts (only needed once)
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```bash
+git clone <repo-url>
+git submodule update --init   # populates mbedtls/ (needed to build!)
 ```
 
 ---
 
-## 3. Clone & prepare WLED
+## Prerequisites
 
-```powershell
-# Go to the f1-lamp repo root
-cd C:\Users\Victor\source\repos\f1-lamp
+- PlatformIO Core (`pio`) — the project uses PlatformIO (espressif32 platform).
+- An ESP32-C3 board with native USB (CDC) — appears as `/dev/cu.usbmodem*`.
+- First build downloads the toolchain (~500 MB) and takes 5–10 min;
+  later builds ~30–60 s.
 
-# Clone WLED into a subfolder called "wled"
-git clone https://github.com/Aircoookie/WLED.git wled
+### Toolchain note (Apple Silicon)
 
-# Enter the WLED directory and check out the latest stable release
-cd wled
-git fetch --tags
-$tag = git describe --tags (git rev-list --tags --max-count=1)
-git checkout $tag
-Write-Host "Checked out WLED $tag"
-```
+The firmware links precompiled ESP-IDF SDK libs (built with GCC 8.4 + newlib)
+together with the Espressif GCC 14.x (picolibc) toolchain. That hybrid has
+real quirks:
 
-> If you want the very latest development code instead, skip the checkout step and stay on `main`.
-> Stable releases are safer.
-
----
-
-## 4. Copy the F1Lamp usermod
-
-Run this from the `f1-lamp` repo root (the directory containing this file):
-
-```powershell
-cd C:\Users\Victor\source\repos\f1-lamp
-
-# Create the usermod folder inside WLED
-New-Item -ItemType Directory -Force "wled\wled00\usermods\F1LampUsermod"
-
-# Copy the usermod header
-Copy-Item -Force "usermod\F1LampUsermod.h" "wled\wled00\usermods\F1LampUsermod\"
-
-# Copy the PlatformIO override (tells PlatformIO about the ESP32-C3 and the flag -D USERMOD_F1_LAMP)
-Copy-Item -Force "platformio_override.ini" "wled\"
-
-Write-Host "Files copied."
-```
+- `wled/src/toolchain_compat.c/.cpp` provide link/runtime shims
+  (`_Unwind_SetEnableExceptionFdeSorting`, `_cleanup_r`, `__atomic_add`,
+  `__exchange_and_add`) — **do not delete them; the build fails without them**.
+- The C library clock functions are unreliable across the hybrid (64-bit
+  `time_t` headers vs 32-bit newlib returns corrupt comparisons). All
+  calendar math lives in `F1TimeUtils.h` as pure 32-bit arithmetic;
+  `f1_clock()` masks the libc clock. Do **not** “simplify” device code back
+  to `mktime`/`gmtime_r`.
 
 ---
 
-## 5. Patch WLED's usermod registration file
+## Build, flash, monitor
 
-WLED needs to know our usermod exists. You add two small blocks to one file.
+All commands run from `wled/`:
 
-Open the file in Notepad:
-```powershell
-notepad wled\wled00\usermods_list.cpp
-```
-
-### Block A — add the include (near the top, after the other `#ifdef USERMOD_` includes)
-
-Find a section that looks like this (there are many similar blocks):
-```cpp
-#ifdef USERMOD_EXAMPLE
-  #include "usermods/example/example.h"
-#endif
-```
-
-Add this block **immediately after** the last similar `#endif`:
-```cpp
-#ifdef USERMOD_F1_LAMP
-  #include "../usermods/F1LampUsermod/F1LampUsermod.h"
-#endif
-```
-
-### Block B — register the instance (inside `void registerUsermods()`)
-
-Scroll down to the function that looks like:
-```cpp
-void registerUsermods()
-{
-  // ... other usermods.add() calls ...
-}
-```
-
-Add this line **inside the function body**, alongside the other `usermods.add()` lines:
-```cpp
-#ifdef USERMOD_F1_LAMP
-  usermods.add(new F1LampUsermod());
-#endif
-```
-
-Save and close Notepad.
-
-> Both blocks are also in `usermods_list_patch.cpp` in this repo for easy copy-paste reference.
-
-### Automated version (optional)
-
-The setup script does both edits automatically:
-```powershell
-cd C:\Users\Victor\source\repos\f1-lamp
-.\scripts\setup.ps1
-```
-
----
-
-## 6. Build the firmware
-
-```powershell
-cd C:\Users\Victor\source\repos\f1-lamp\wled
-
-# First build downloads the ESP32 toolchain (~500 MB) — takes 5-10 min once.
-# Subsequent builds are fast (~30-60 s).
+```bash
+# Build firmware
 pio run -e esp32c3_f1lamp
+
+# Build + flash (auto-detect port, or pass --upload-port /dev/cu.usbmodemXXXX)
+pio run -e esp32c3_f1lamp --target upload
+
+# Serial monitor (115200 baud)
+pio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
+
+# Host-side unit tests (currently zero tests — known gap)
+pio test -e native_test
 ```
 
-If the build succeeds you will see output ending with:
-```
-RAM:   [=         ]  xx.x% (used xxxxx bytes from 327680 bytes)
-Flash: [====      ]  xx.x% (used xxxxxxx bytes from 4194304 bytes)
-========================= [SUCCESS] Took xx.xx seconds =========================
+If upload fails with “Failed to connect”: hold **BOOT**, tap **RESET**,
+release **BOOT**, retry.
+
+### Web UI filesystem (LittleFS)
+
+The web UI lives in `wled/data/*` and is baked into the LittleFS partition
+with:
+
+```bash
+pio run -e esp32c3_f1lamp -t uploadfs
 ```
 
-If you see errors, check the [Troubleshooting](#12-troubleshooting) section.
+> ⚠️ `uploadfs` **wipes the whole LittleFS partition**, including the saved
+> `/config.json` (WiFi credentials, LED config, delay, feature flags). Prefer
+> pushing single files with the OTA file endpoint (below), which does not
+> touch other files.
+
+### OTA / file updates over the network
+
+Firmware OTA: web UI **Settings → Firmware Update**, or
+
+```bash
+curl -F "firmware=@.pio/build/esp32c3_f1lamp/firmware.bin" http://<ip>/api/update
+```
+
+Web assets (html/css/js/json) can be replaced one at a time without wiping the
+filesystem:
+
+```bash
+curl -F "file=@index.html" "http://<ip>/api/file?name=/index.html"
+```
+
+(Allows only `.html/.css/.js/.json`, rejects `..`.)
 
 ---
 
-## 7. Flash to the ESP32-C3
-
-### Normal upload
-
-Connect your ESP32-C3 via USB, then:
-
-```powershell
-cd C:\Users\Victor\source\repos\f1-lamp\wled
-
-# Replace COM3 with your actual port (from Device Manager)
-pio run -e esp32c3_f1lamp --target upload --upload-port COM3
-```
-
-If you leave out `--upload-port`, PlatformIO will try to auto-detect. That usually works.
-
-### Bootloader mode (if upload fails with "Failed to connect")
-
-1. Hold the **BOOT** button on the board.
-2. While holding BOOT, briefly press and release **RESET** (or unplug/replug the USB cable while holding BOOT).
-3. Release BOOT — the board is now in download mode (you may see a different COM port appear).
-4. Run the upload command above.
-
-### VS Code alternative
-
-1. Open the `wled/` folder in VS Code.
-2. PlatformIO will detect the project automatically.
-3. Select `esp32c3_f1lamp` in the environment picker (bottom status bar).
-4. Click the **→ Upload** button (arrow icon in the bottom bar).
-
----
-
-## 8. First boot & WiFi setup
-
-After flashing:
-
-1. The ESP32-C3 reboots and broadcasts a WiFi access point named **`WLED-AP`** (password: `wled1234`).
-2. Connect your phone or laptop to `WLED-AP`.
-3. A captive portal opens automatically (if not, navigate to `http://4.3.2.1`).
-4. Go to **WiFi Settings** and enter your home WiFi credentials.
-5. WLED reboots and connects to your home network.
-6. Find the device IP in your router's admin panel (look for a device named `WLED`), or use the WLED Android/iOS app which auto-discovers it.
-7. Open `http://<your-wled-ip>` in a browser.
-
-> **Tip:** Set a static IP or DHCP reservation for the ESP32-C3 in your router. Makes life easier.
-
----
-
-## 9. Testing without a live race
-
-The usermod has a built-in **Force State** feature. When active, it bypasses the SignalR connection and locks the lamp in a specific F1 state. You can trigger it in two ways:
-
-### Method A — WLED web UI (easiest)
-
-1. Open `http://<wled-ip>` → **Settings** → **Usermods**.
-2. Find the **F1Lamp** section.
-3. Set **`forceState`** to a number:
-
-| Value | State | What you'll see |
-|---|---|---|
-| `0` | Off (live mode) | Normal SignalR operation |
-| `1` | IDLE | Playlist 12 — dim red (preset 1) |
-| `2` | SESSION START | Playlist 20 — formation lap animation |
-| `3` | GREEN FLAG | Playlist 15 — solid green |
-| `4` | YELLOW FLAG | Playlist 16 — amber blink |
-| `5` | SAFETY CAR | Playlist 13 — amber chase |
-| `6` | VIRTUAL SC | Playlist 22 — VSC pulse |
-| `7` | RED FLAG | Playlist 14 — red blink |
-| `8` | CHEQUERED | Playlist 23 — white/black × 15 |
-
-4. Click **Save**. The lamp changes instantly.
-5. Set back to `0` to return to live mode.
-
-### Method B — HTTP API (scriptable, no browser needed)
-
-Use PowerShell to cycle through all states automatically:
-
-```powershell
-$ip = "192.168.1.XXX"   # ← replace with your WLED IP
-
-$states = @{1="IDLE"; 2="SESSION START"; 3="GREEN"; 4="YELLOW"; 5="SC"; 6="VSC"; 7="RED FLAG"; 8="CHEQUERED"}
-
-foreach ($num in 1..8) {
-    Write-Host "Testing state $num : $($states[$num])"
-    Invoke-RestMethod -Method Post -Uri "http://$ip/json/um" `
-        -ContentType "application/json" `
-        -Body "{`"F1Lamp`":{`"forceState`":$num}}"
-    Start-Sleep -Seconds 4   # watch for 4 seconds
-}
-
-# Restore live mode
-Invoke-RestMethod -Method Post -Uri "http://$ip/json/um" `
-    -ContentType "application/json" `
-    -Body '{"F1Lamp":{"forceState":0}}'
-Write-Host "Done - back to live mode"
-```
-
-### Method C — test a single state directly
-
-```powershell
-$ip = "192.168.1.XXX"
-
-# Lock on RED FLAG  
-Invoke-RestMethod -Method Post -Uri "http://$ip/json/um" `
-    -ContentType "application/json" `
-    -Body '{"F1Lamp":{"forceState":7}}'
-
-# Restore live mode
-Invoke-RestMethod -Method Post -Uri "http://$ip/json/um" `
-    -ContentType "application/json" `
-    -Body '{"F1Lamp":{"forceState":0}}'
-```
-
-### Checking the current state
-
-```powershell
-# GET the current usermod state
-Invoke-RestMethod -Uri "http://$ip/json/um" | ConvertTo-Json
-```
-
-Or in the WLED UI, tap the **ℹ Info** button — you'll see:
-```
-F1 Status  │  Red flag
-F1 Stream  │  TEST MODE
-```
-
----
-
-## 10. Serial monitor (debug logs)
-
-The firmware prints detailed logs to the serial port. View them with:
-
-```powershell
-cd C:\Users\Victor\source\repos\f1-lamp\wled
-pio device monitor --port COM3 --baud 115200
-```
-
-Or in VS Code: click the **🔌 Serial Monitor** plug icon in the PlatformIO sidebar.
-
-You'll see output like:
-```
-[F1Lamp] SignalR usermod ready
-[F1Lamp] Negotiating with F1 timing service...
-[F1Lamp] Token obtained (len=148)
-[F1Lamp] WS connecting...
-[F1Lamp] WS connected → /signalr/connect?...
-[F1Lamp] Subscribe sent (TrackStatus, SessionStatus, Heartbeat)
-[F1Lamp] SessionStatus: Inactive
-[F1Lamp] → IDLE (pl.12)  preset=12
-[F1Lamp] Heartbeat ♥
-```
-
-Press **Ctrl+C** to exit the monitor.
-
----
-
-## 11. Updating after code changes
-
-When you edit `F1LampUsermod.h` in this repo, re-deploy with:
-
-```powershell
-# Copy the updated file
-Copy-Item -Force `
-    "C:\Users\Victor\source\repos\f1-lamp\usermod\F1LampUsermod.h" `
-    "C:\Users\Victor\source\repos\f1-lamp\wled\wled00\usermods\F1LampUsermod\"
-
-# Rebuild and flash
-cd C:\Users\Victor\source\repos\f1-lamp\wled
-pio run -e esp32c3_f1lamp --target upload --upload-port COM3
-```
-
-WLED preserves its configuration (WiFi credentials, presets, usermod settings) across firmware updates because it stores them in a separate flash partition.
-
----
-
-## 12. Troubleshooting
-
-### Build errors
-
-| Error | Fix |
-|---|---|
-| `'WebSocketsClient' was not declared` | Run `pio lib install` inside `wled/`, then rebuild |
-| `'applyPreset' was not declared` | WLED version is too old; update to the latest release tag |
-| `Multiple definition of F1LampUsermod::_instance` | You added the `#include` in `usermods_list.cpp` twice; remove the duplicate |
-| Python / pip not found | Re-run the Python installer and tick "Add to PATH" |
-| `pio: command not found` | `pip install platformio` or restart PowerShell after install |
-
-### Flash / upload errors
-
-| Error | Fix |
-|---|---|
-| `Failed to connect to ESP32: Timed out` | Enter bootloader mode: hold BOOT, press RESET, release BOOT, then retry |
-| `No serial port found` | Check Device Manager; install the correct USB driver (see §1.4) |
-| Upload completes but device doesn't appear | Try a different USB cable (some cheap cables are power-only, no data) |
-| Wrong COM port | Check Device Manager → Ports and update `--upload-port COMx` |
-
-### Runtime issues
-
-| Symptom | Fix |
-|---|---|
-| `F1 Stream: offline` | WiFi not connected or F1 server unreachable; reconnect happens automatically |
-| Lamp stuck on one state | Check if `forceState` is non-zero in Settings → Usermods; set to `0` |
-| Preset not triggering | Verify the preset ID exists in Settings → Presets (hover to see the ID) |
-| Preset resets to 0 after save | Use values 1–250; WLED does not have preset 0 |
-| `[F1Lamp] Negotiate HTTP 403` | F1 server rate-limiting; wait 60 s, device will auto-retry |
-
-### Finding your WLED IP
-
-```powershell
-# Scan your local network for the device (replace 192.168.1 with your subnet)
-1..254 | ForEach-Object {
-    $ip = "192.168.1.$_"
-    if (Test-Connection -ComputerName $ip -Count 1 -Quiet) {
-        $hostname = try { [System.Net.Dns]::GetHostEntry($ip).HostName } catch { "?" }
-        Write-Host "$ip  $hostname"
-    }
-}
-```
-
-Or use the free tool [Angry IP Scanner](https://angryip.org/).
-
----
-
-## Quick reference card
-
-```
-# One-time setup
-pip install platformio
-git clone https://github.com/Aircoookie/WLED.git wled
-
-# Every time you edit the usermod
-Copy-Item -Force "usermod\F1LampUsermod.h" "wled\wled00\usermods\F1LampUsermod\"
-cd wled
-pio run -e esp32c3_f1lamp --target upload --upload-port COM3
-
-# Test a state (5 = Safety Car)
-Invoke-RestMethod -Method Post -Uri "http://192.168.1.XXX/json/um" `
-    -ContentType "application/json" -Body '{"F1Lamp":{"forceState":5}}'
-
-# Watch serial logs
-pio device monitor --port COM3 --baud 115200
-
-# Back to live mode
-Invoke-RestMethod -Method Post -Uri "http://192.168.1.XXX/json/um" `
-    -ContentType "application/json" -Body '{"F1Lamp":{"forceState":0}}'
-```
+## Network model
+
+- The **AP `F1-Lamp` (password `f1lamp123`) is always on** → the device is
+  always reachable at `http://192.168.4.1`, even without home WiFi.
+- When saved STA credentials exist it also joins that network; mDNS
+  `f1lamp.local` resolves only in STA mode.
+- Live timing requires STA.
+
+## Configuration
+
+Saved on LittleFS as `/config.json` (see `wled/src/Config.*`):
+
+- WiFi (`ssid`, `pass`)
+- LED hardware: `led_count`, `f_count` (LEDs forming the “F”), `brightness`
+- `power`, `delay_s` (event→LED delay, default 40 s)
+- Feature flags: fastest-lap flash, DRS flash, start lights, deep sleep
+- **LED reaction switches** (`react_track`, `react_global`, `react_sector`):
+  - `react_track`  — react to TrackStatus codes (ON)
+  - `react_global` — react to global race-control messages: RED FLAG, SAFETY
+    CAR, VSC, CHEQUERED (ON) — these are what the TV mirrors (TrackStatus in
+    this feed can stay “2/Yellow” through SC/red periods)
+  - `react_sector` — treat “YELLOW IN TRACK SECTOR x” notes as yellow (OFF)
+- Per-state effects (`states[]`, index = `F1NetState`)
+
+Toggles live on the **Features** page; the delay slider is on **Settings**.
+
+## Live-timing behaviour
+
+- Connects to `livetiming.formula1.com/signalrcore` (SignalR Core JSON,
+  record separator `0x1E`), subscribes to `TrackStatus`, `SessionStatus`,
+  `Heartbeat`, `RaceControlMessages`.
+- The SignalR handshake and every protocol message must be sent as **masked
+  WebSocket text frames** — sending raw bytes makes the server close with
+  code 1002.
+- On (re)connect the snapshot sets the current LED state; stale queued events
+  are dropped so only the *latest* state applies. The most recent
+  race-control messages from the snapshot backlog restore the correct flag if
+  the device boots mid-incident. Snapshot values are **not** written to the
+  event log (they would look like events that happened at boot time).
+- Events are logged (up to 40) and shown in the UI; logging is independent of
+  the reaction switches.
+
+## Calendar / sessions
+
+- **Next-race card**: fetched from the f1calendar CDN feed
+  (`cdn.jsdelivr.net/gh/sportstimes/f1@main/_db/f1/<year>.json`, fallback to
+  `raw.githubusercontent.com`), with a built-in 2026 table as last resort.
+- **Sessions page**: also uses the CDN calendar feed (all meetings, all
+  sessions: FP1/FP2/FP3, Sprint, Qualifying, Race), prefetched at boot before
+  the live WebSocket allocates its TLS buffers.
+  - Known limitation: replay of a specific historical session needs the
+    livetiming `Index.json` stream paths; that endpoint intermittently
+    truncates large responses on this device, so per-session replay buttons
+    are currently disabled. The built-in demo replay still works.
+- Deep sleep: when enabled, the device wakes periodically, checks whether the
+  next race weekend is near, and sleeps otherwise.
+
+## Troubleshooting
+
+- Serial markers: `[F1Net]` connection phases (`wifi`, `connecting`, `live`,
+  …); `[F1Cal]`, `[F1Sess]`, `[F1Lamp]` for their subsystems.
+- `GET /api/status` → `f1phase`, `f1err`, `state`, `connected`.
+- `GET /api/sessions_debug?reset=1` resets a failed session fetch.
+- Do not include `ESPAsyncWebServer.h` in `F1NetWork.cpp`/`F1Sessions.cpp`
+  (enum collisions with the IDF HTTP parser). Raw mbedTLS + lwIP sockets only.
+- The firmware intentionally does not verify the server certificate
+  (`MBEDTLS_SSL_VERIFY_NONE`).

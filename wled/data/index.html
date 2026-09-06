@@ -15,7 +15,7 @@
   <div class="info-row"><span>Network</span><span id="wifiInfo">Loading…</span></div>
   <div class="info-row"><span>IP</span><span id="ipInfo" style="font-family:monospace;font-size:.8rem">—</span></div>
   <div class="info-row"><span>Signal</span><span id="rssiInfo">—</span></div>
-  <div class="info-row"><span>F1 LiveTiming</span><span id="f1Ok">—</span></div>
+  <div class="info-row"><span>F1 LiveTiming</span><span style="display:flex;align-items:center;gap:8px"><span id="f1Ok">—</span><button id="f1ReconnBtn" onclick="f1Reconnect()" style="display:none;font-size:.7rem;padding:2px 8px;background:#333;color:#ccc;border:1px solid #555;border-radius:4px;cursor:pointer">Reconnect</button></span></div>
   <div class="info-row" id="raceRow" style="display:none"><span>Race Week</span><span id="raceLabel" style="color:#ffc800">—</span></div>
   <div class="info-row" id="rampRow" style="display:none"><span>Idle ramp</span><span id="rampPct">—</span></div>
   <div class="info-row"><span>Free heap</span><span id="heapInfo" style="font-size:.8rem">—</span></div>
@@ -68,7 +68,7 @@
     </div>
   </div>
   <div id="evStatus" style="font-size:.78rem;color:#666;margin-bottom:8px"></div>
-  <div id="evList" style="max-height:320px;overflow-y:auto"></div>
+  <div id="evList" style="max-height:680px;overflow-y:auto"></div>
   <div id="evEmpty" style="color:#555;font-size:.85rem;display:none">No events yet</div>
 </div>
 
@@ -84,6 +84,12 @@ function onBri(v){
   briTimer=setTimeout(()=>fetch('/api/bri?v='+v,{method:'POST'}),200);
 }
 async function forceState(s){await fetch('/api/force?s='+s,{method:'POST'});}
+async function f1Reconnect(){
+  const btn=document.getElementById('f1ReconnBtn');
+  btn.disabled=true; btn.textContent='…';
+  await fetch('/api/f1reconnect');
+  setTimeout(()=>{btn.disabled=false; btn.textContent='Reconnect';},3000);
+}
 
 function onStatus(d){
   const idx=Math.min(d.state,SN.length-1);
@@ -95,8 +101,29 @@ function onStatus(d){
   document.getElementById('ipInfo').textContent=d.ip||'—';
   const rssiEl=document.getElementById('rssiInfo');
   if(d.rssi){const rs=d.rssi;const col=rs>-60?'#00d2be':rs>-75?'#ffc800':'#e10600';rssiEl.textContent=rs+' dBm';rssiEl.style.color=col;}else{rssiEl.textContent=d.ap?'AP mode':'—';}
-  document.getElementById('f1Ok').textContent=d.f1ok?'✓ Connected':'⏳ Waiting for session';
-  document.getElementById('f1Ok').style.color=d.f1ok?'#00d2be':'#aaa';
+  if(d.f1ok && d.sessionActive){
+    document.getElementById('f1Ok').textContent='● Live Session';
+    document.getElementById('f1Ok').style.color='#00c800';
+    document.getElementById('f1ReconnBtn').style.display='none';
+  } else if(d.f1ok){
+    document.getElementById('f1Ok').textContent='✓ Connected';
+    document.getElementById('f1Ok').style.color='#00d2be';
+    document.getElementById('f1ReconnBtn').style.display='none';
+  } else {
+    const phase=d.f1phase||'';
+    let msg='⏳ Waiting…';
+    if(phase==='wifi')           msg='⏳ No WiFi';
+    else if(phase==='cal')       msg='⏳ Fetching calendar…';
+    else if(phase==='sess')      msg='⏳ Fetching sessions…';
+    else if(phase==='connecting')msg='⏳ Connecting to F1…';
+    else if(phase==='wait')      msg='⏳ Reconnecting…';
+    else if(d.ssid && !d.ap)     msg='⏳ Connecting…';
+    document.getElementById('f1Ok').textContent=msg;
+    document.getElementById('f1Ok').style.color='#aaa';
+    /* Show reconnect button only when in backoff wait (not wifi/AP-only) */
+    const showBtn = phase==='wait'||phase==='connecting';
+    document.getElementById('f1ReconnBtn').style.display=showBtn?'inline-block':'none';
+  }
   document.getElementById('briSlider').value=d.bri;
   document.getElementById('briVal').textContent=d.bri;
   const hasRace=d.nextRace&&d.nextRace!=='—';
@@ -106,6 +133,10 @@ function onStatus(d){
   document.getElementById('rampRow').style.display=hasRamp?'flex':'none';
   document.getElementById('rampPct').textContent=hasRamp?(d.rampPct+'%'):'';
   document.getElementById('heapInfo').textContent=(d.heap/1024).toFixed(1)+' KB';
+  /* update session-active flag and re-render session list only when it changes */
+  const _prevActive = _sessionActive;
+  _sessionActive = !!d.sessionActive;
+  if(_sessionActive !== _prevActive) renderNextRaceSessions();
   /* effect detail */
   const ep=document.getElementById('effDetail');
   if(d.eff){
@@ -144,62 +175,146 @@ function onStatus(d){
 })();
 
 /* ── Next Race Weekend ──────────────────────────────────────────────── */
-async function loadNextRace(){
+let _nrData = null;
+let _sessionActive = false;
+
+/* Max session duration (ms) used to decide whether a session already ended */
+function sessMaxDuration(name){
+  if(name==='Race') return 3*3600000;
+  if(name.includes('Qual')) return 90*60000;
+  if(name==='Sprint') return 45*60000;
+  return 90*60000; /* FP1/FP2/FP3 */
+}
+
+function applyNextRace(d){
+  _nrData=d;
   const card=document.getElementById('nextRaceCard');
+  if(!d.raceName){card.style.display='none';return;}
+  card.style.display='block';
+  document.getElementById('nrTitle').textContent=d.raceName;
+  let meta='';
+  if(d.circuit) meta+=d.circuit;
+  if(d.locality) meta+=' — '+d.locality;
+  if(d.country) meta+=', '+d.country;
+  if(d.round) meta+=' (Round '+d.round+')';
+  if(d.sessions&&d.sessions.length) meta+=' — '+d.sessions.length+' sessions';
+  document.getElementById('nrMeta').textContent=meta;
+  renderNextRaceSessions();
+}
+
+function renderNextRaceSessions(){
+  if(!_nrData||!_nrData.sessions||!_nrData.sessions.length) return;
+  const cont=document.getElementById('nrSessions');
+  if(!cont) return;
+  const now=new Date();
+  /* Always show the weekend in chronological order, starting with FP1 */
+  const sess=_nrData.sessions.map((s,i)=>({...s,idx:i}))
+        .filter(s=>s.dateTime)
+        .sort((a,b)=>new Date(a.dateTime)-new Date(b.dateTime));
+  if(!sess.length) return;
+
+  /* Which session is live right now? */
+  let liveIdx=-1;
+  sess.forEach((s,i)=>{
+    const start=new Date(s.dateTime);
+    const elapsed=now-start;
+    if(_sessionActive){
+      if(elapsed>=0) liveIdx=i;            /* trust live timing: last started */
+    }else if(elapsed>=0 && elapsed<sessMaxDuration(s.name)){
+      liveIdx=i;                            /* schedule-based estimate        */
+    }
+  });
+
+  const dayOpts={weekday:'short',month:'short',day:'numeric'};
+  const timeOpts={hour:'2-digit',minute:'2-digit',hour12:false};
+  const tz=now.toLocaleTimeString(undefined,{timeZoneName:'short'}).split(' ').pop();
+
+  let html='<div style="display:grid;grid-template-columns:auto 1fr auto;gap:2px 10px;align-items:center">';
+  html+='<div style="font-size:.6rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding:2px 0">State</div>';
+  html+='<div style="font-size:.6rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding:2px 0">Session</div>';
+  html+='<div style="font-size:.6rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding:2px 0;text-align:right">Local time</div>';
+
+  sess.forEach((s,i)=>{
+    const dt=new Date(s.dateTime);
+    const elapsed=now-dt;
+    const isLive=i===liveIdx;
+    const isDone=(dt<now && !isLive) || (!_sessionActive && elapsed>=sessMaxDuration(s.name));
+    const isSoon=!isDone&&!isLive&&dt>now&&(dt-now)<3600000;
+    const isRace=s.name==='Race';
+    const isToday=dt.toDateString()===now.toDateString();
+    const dayStr=dt.toLocaleDateString(undefined,dayOpts);
+    const timeStr=dt.toLocaleTimeString(undefined,timeOpts);
+
+    /* chips */
+    let chip='';
+    if(isDone) chip='<span style="font-size:.72rem;color:#2ecc71;font-weight:700" title="Finished">✓</span>';
+    else if(isLive) chip='<span style="font-size:.6rem;padding:1px 6px;border-radius:8px;background:#063;color:#7dffa0;border:1px solid #2ecc71">● LIVE</span>';
+    else if(isSoon) chip='<span style="font-size:.6rem;padding:1px 6px;border-radius:8px;background:#3a2e00;color:#ffc800;border:1px solid #ffc800">SOON</span>';
+    else chip='<span style="font-size:.6rem;color:#3a4552">upcoming</span>';
+
+    let nameColor=isLive?'#2ecc71':isDone?'#666':isRace?'#e10600':isSoon?'#ffc800':'#d8dee6';
+    let nameWeight=isLive||isRace?'700':'400';
+    let timeColor=isLive?'#2ecc71':isDone?'#555':isSoon?'#ffc800':isToday?'#00d2be':'#8f9aa3';
+    let rowBg=isLive?'background:#0a2414;border-radius:4px;':'';
+
+    const nameCell='<span style="font-weight:'+nameWeight+';color:'+nameColor+'">'+escHtml(s.name)+'</span>';
+    const timeCell=isToday
+      ?'<span style="color:'+timeColor+'">'+timeStr+'</span><span style="color:#556;font-size:.6rem"> today</span>'
+      :'<span style="color:'+timeColor+'">'+dayStr+' · '+timeStr+'</span>';
+
+    html+='<div style="'+rowBg+'">'+chip+'</div>';
+    html+='<div style="font-size:.9rem;'+rowBg+'">'+nameCell+'</div>';
+    html+='<div style="font-size:.8rem;text-align:right;font-family:monospace;'+rowBg+'">'+timeCell+'</div>';
+  });
+  html+='</div>';
+
+  const sourceTxt=_nrData.fromApi
+      ?'f1calendar.com (online)'
+      :(_nrData.sessions.length>2?'built-in calendar':'built-in calendar — full session list loads online');
+  html+='<div style="margin-top:8px;font-size:.62rem;color:#555;border-top:1px solid #222;padding-top:4px">'
+       +'Source: '+sourceTxt+' · times shown in your local timezone ('+tz+')</div>';
+  cont.innerHTML=html;
+}
+
+async function loadNextRace(){
   const errEl=document.getElementById('nrError');
   try{
     let d;
-    for(let i=0;i<20;i++){
+    for(let i=0;i<24;i++){
       d=await(await fetch('/api/nextrace')).json();
       if(!d.loading) break;
-      await new Promise(r=>setTimeout(r,1500));
+      await new Promise(r=>setTimeout(r,1000));
     }
-    if(d.loading){errEl.textContent='Still loading calendar…';errEl.style.display='block';card.style.display='block';return;}
-    if(d.error){errEl.textContent='Error: '+d.error;errEl.style.display='block';card.style.display='block';return;}
-    if(!d.raceName){return;} /* no data yet */
-    card.style.display='block';
-    /* Title */
-    document.getElementById('nrTitle').textContent=d.raceName;
-    /* Meta: circuit, location */
-    let meta='';
-    if(d.circuit) meta+=d.circuit;
-    if(d.locality) meta+=' — '+d.locality;
-    if(d.country) meta+=', '+d.country;
-    if(d.round) meta+=' (Round '+d.round+')';
-    document.getElementById('nrMeta').textContent=meta;
-    /* Sessions table */
-    const cont=document.getElementById('nrSessions');
-    if(!d.sessions||!d.sessions.length){cont.innerHTML='<span style="color:#555">No session data</span>';return;}
-    const now=new Date();
-    /* Format options for local time */
-    const dayOpts={weekday:'short',month:'short',day:'numeric'};
-    const timeOpts={hour:'2-digit',minute:'2-digit',hour12:false};
-    let html='<div style="display:grid;grid-template-columns:1fr auto auto;gap:4px 12px;align-items:center">';
-    /* Header */
-    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px">Session</div>';
-    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px;text-align:right">Day</div>';
-    html+='<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:#555;padding-bottom:2px;text-align:right">Time</div>';
-    d.sessions.forEach(s=>{
-      const dt=new Date(s.dateTime);
-      const isPast=dt<now;
-      const isToday=dt.toDateString()===now.toDateString();
-      const isSoon=!isPast&&(dt-now)<3600000; /* within 1h */
-      const dayStr=dt.toLocaleDateString(undefined,dayOpts);
-      const timeStr=dt.toLocaleTimeString(undefined,timeOpts);
-      let nameColor=isPast?'#555':s.name==='Race'?'#e10600':'#ccc';
-      let timeColor=isPast?'#444':isSoon?'#ffc800':isToday?'#00d2be':'#888';
-      let badge='';
-      if(isPast) badge=' <span style="font-size:.6rem;color:#444">✓</span>';
-      else if(isSoon) badge=' <span style="font-size:.6rem;color:#ffc800">SOON</span>';
-      html+='<div style="font-size:.85rem;font-weight:'+(s.name==='Race'?'700':'400')+';color:'+nameColor+'">'+escHtml(s.name)+badge+'</div>';
-      html+='<div style="font-size:.82rem;color:'+timeColor+';text-align:right">'+dayStr+'</div>';
-      html+='<div style="font-size:.82rem;color:'+timeColor+';text-align:right;font-family:monospace">'+timeStr+'</div>';
-    });
-    html+='</div>';
-    /* Source indicator */
-    html+='<div style="margin-top:8px;font-size:.65rem;color:#444">Source: '+(d.fromApi?'f1calendar.com (online)':'Built-in calendar')+'</div>';
-    cont.innerHTML=html;
-  }catch(e){errEl.textContent='Failed: '+e.message;errEl.style.display='block';card.style.display='block';}
+    if(d&&d.loading){errEl.textContent='Still loading calendar…';errEl.style.display='block';return;}
+    if(d&&d.error){
+      /* Show an error only when we have nothing else to display */
+      if(!_nrData){errEl.textContent='Calendar: '+d.error;errEl.style.display='block';}
+      return;
+    }
+    errEl.style.display='none';
+    applyNextRace(d);
+    /* Refresh periodically: keeps done/live/soon states fresh AND adopts
+       the full online schedule once the API fetch lands (the built-in
+       fallback only knows FP1 + Race). */
+    setInterval(refreshNextRace,30000);
+  }catch(e){errEl.textContent='Failed: '+e.message;errEl.style.display='block';}
+}
+
+async function refreshNextRace(){
+  try{
+    const d=await(await fetch('/api/nextrace')).json();
+    if(!d||d.loading||d.error||!d.raceName) return;
+    const cur=_nrData;
+    if(!cur||!cur.raceName){
+      document.getElementById('nrError').style.display='none';
+      applyNextRace(d);
+      return;
+    }
+    const changed=(cur.raceName!==d.raceName)
+      ||(!cur.fromApi&&d.fromApi)
+      ||((cur.sessions||[]).length!==(d.sessions||[]).length);
+    if(changed) applyNextRace(d); else renderNextRaceSessions();
+  }catch(_){/* keep last good data */}
 }
 
 /* ── Live Session Events ──────────────────────────────────────────── */
@@ -254,8 +369,11 @@ async function loadEvents(){
       lastEvCount=evts.length;
       const timeOpts={hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false};
       let html='';
-      /* Show newest first */
-      for(let i=evts.length-1;i>=0;i--){
+      /* Show the newest up to 40 events first (full log ring) */
+      const maxShow=40;
+      const startIdx=evts.length-1;
+      const stopIdx=Math.max(-1,evts.length-1-maxShow);
+      for(let i=startIdx;i>stopIdx;i--){
         const e=evts[i];
         const t=new Date(e.t*1000);
         const ts=t.toLocaleTimeString(undefined,timeOpts);

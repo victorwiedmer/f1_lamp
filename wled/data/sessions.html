@@ -158,16 +158,52 @@ async function loadSessions(){
     if(d.loading){list.innerHTML='<span style="color:#e10600">Timed out waiting for data.</span>';return;}
     if(d.error){list.innerHTML='<span style="color:#e10600">Error: '+escHtml(d.error)+'</span><br><button class="btn btn-sm btn-outline" onclick="fetch(\'/api/sessions_debug?reset=1\').then(()=>loadSessions())">Retry</button>';return;}
     if(!d.meetings||!d.meetings.length){list.innerHTML='No sessions found.';return;}
+
+    /* Check if a session is currently live via SignalR */
+    let liveActive=false;
+    try{
+      const ev=await(await fetch('/api/events')).json();
+      liveActive=!!(ev.active&&ev.connected);
+    }catch(e){}
+
+    /* Determine today's date string (YYYY-MM-DD) for live-session matching */
+    const todayStr=new Date().toISOString().substring(0,10);
+
     let html='';
     d.meetings.forEach(m=>{
       html+=`<div style="margin-top:8px"><span style="color:#e10600;font-weight:700">${escHtml(m.name)}</span>`;
       html+=` <span style="color:#555">— ${escHtml(m.location||'')}</span></div>`;
-      (m.sessions||[]).forEach(s=>{
+
+      /* Find the live session in this meeting: if liveActive, the session whose
+         date starts with today's date and is the most-recently-started one. */
+      let liveSessionIdx=-1;
+      if(liveActive){
+        const sessions=m.sessions||[];
+        let bestTime=-Infinity;
+        sessions.forEach((s,i)=>{
+          /* date is "YYYY-MM-DD HH:MM" – check date portion */
+          const sDateStr=(s.date||'').substring(0,10);
+          if(sDateStr===todayStr){
+            const t=new Date(s.date.replace(' ','T')+'Z').getTime();
+            const now=Date.now();
+            /* Started in the past */
+            if(t<=now && t>bestTime){bestTime=t;liveSessionIdx=i;}
+          }
+        });
+      }
+
+      (m.sessions||[]).forEach((s,i)=>{
+        const isLive=i===liveSessionIdx;
         const hasPath=!!s.path;
         const icon=s.type==='Race'?'\ud83c\udfc1':s.type==='Qualifying'?'\u23f1':'\ud83d\udee0';
-        const col=hasPath?'#ccc':'#555';
-        html+=`<div style="margin-left:12px;padding:2px 0;color:${col}">`;
-        html+=`${icon} <b>${escHtml(s.name)}</b> <span style="color:#555;font-size:.7rem">${escHtml(s.date||'')}</span>`;
+        const col=isLive?'#00c800':hasPath?'#ccc':'#555';
+        const rowBg=isLive?'background:#0a1a0a;border-radius:4px;padding:3px 4px;':'';
+        html+=`<div style="margin-left:12px;padding:2px 0;${rowBg}color:${col}">`;
+        html+=`${icon} <b>${escHtml(s.name)}</b>`;
+        if(isLive){
+          html+=' <span style="font-size:.62rem;padding:1px 5px;border-radius:8px;background:#0a2a0a;color:#00c800;border:1px solid #00c800">● LIVE</span>';
+        }
+        html+=` <span style="color:${isLive?'#006600':'#555'};font-size:.7rem">${escHtml(s.date||'')}</span>`;
         if(hasPath){const pi=sessionPaths.length;sessionPaths.push(s.path);html+=` <button class="btn btn-sm" style="font-size:.6rem;padding:1px 6px;background:#003a35;color:#00d2be;border:1px solid #005a4e;cursor:pointer" onclick="startSessionReplay(${pi})">&#9654; Replay</button>`;}
         html+=`</div>`;
       });

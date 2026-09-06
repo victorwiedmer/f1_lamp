@@ -39,6 +39,27 @@
     </div>
     <input type="checkbox" class="feat-toggle" id="feat_deep_sleep" onchange="saveFeature('deep_sleep',this.checked)">
   </div>
+  <div class="feat-row">
+    <div style="flex:1">
+      <div class="feat-title">&#128663; TrackStatus flags</div>
+      <div class="feat-desc">React to live timing TrackStatus codes (green / yellow / safety car / red / VSC).</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_track" onchange="saveFeature('track',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div style="flex:1">
+      <div class="feat-title">&#128681; Global race-control flags</div>
+      <div class="feat-desc">React to global announcements (RED FLAG, SAFETY CAR, VSC, CHEQUERED) - the flags the TV mirrors.</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_global" onchange="saveFeature('global',this.checked)">
+  </div>
+  <div class="feat-row">
+    <div style="flex:1">
+      <div class="feat-title">&#127937; Sector-local yellow notes</div>
+      <div class="feat-desc">Treat &quot;YELLOW IN TRACK SECTOR x&quot; notes as yellow. Off by default (noisy local marshalling info).</div>
+    </div>
+    <input type="checkbox" class="feat-toggle" id="feat_sector" onchange="saveFeature('sector',this.checked)">
+  </div>
   <hr>
   <div style="font-size:.7rem;color:#555;margin-bottom:6px">Test without a live session:</div>
   <div style="display:flex;flex-wrap:wrap;gap:5px">
@@ -61,6 +82,9 @@ async function loadFeatures(){
     document.getElementById('feat_drs').checked          = d.drs           ||false;
     document.getElementById('feat_start_lights').checked = d.start_lights  ||false;
     document.getElementById('feat_deep_sleep').checked   = d.deep_sleep    ||false;
+    document.getElementById('feat_track').checked         = d.track===undefined?true:!!d.track;
+    document.getElementById('feat_global').checked        = d.global===undefined?true:!!d.global;
+    document.getElementById('feat_sector').checked        = d.sector===undefined?false:!!d.sector;
   }catch(e){}
 }
 async function saveFeature(name,val){
