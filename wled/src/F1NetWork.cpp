@@ -50,6 +50,7 @@
 #include "F1Calendar.h"
 #include "F1StringUtils.h"  /* f1_url_encode, f1_json_str */
 #include "F1TimeUtils.h"    /* f1_clock() – clean 32-bit wall clock */
+#include "F1Reaction.h"     /* f1_rcEventToState / f1_trackCodeToState (pure) */
 #include "Config.h"         /* g_cfg.react_* – which events the LED reacts to */
 
 /* ----------------------------------------------------------------
@@ -181,75 +182,6 @@ static bool json_str(const char* json, const char* key,
                      char* out, size_t out_size)
 {
     return f1_json_str(json, key, out, out_size);
-}
-
-/* Case-insensitive substring test (avoids strcasestr availability issues) */
-static bool f1_contains_ci(const char* hay, const char* needle)
-{
-    if (!hay || !needle || !needle[0]) return false;
-    size_t nl = strlen(needle);
-    for (const char* p = hay; *p; ++p) {
-        size_t i = 0;
-        while (i < nl && p[i] &&
-               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
-            ++i;
-        if (i == nl) return true;
-    }
-    return false;
-}
-
-/* Decide which LED state a RaceControl message drives, honouring the
-   user's g_cfg.react_* switches.  Returns F1ST_UNKNOWN when the message
-   should not change the LED.  Green/clear is deliberately left to the
-   TrackStatus code 1, because RC "TRACK CLEAR"-style notes proved
-   ambiguous in the live feed. */
-static F1NetState rcEventToState(const char* cat, const char* flag,
-                                 const char* scope, const char* text)
-{
-    if (!g_cfg.react_global && !g_cfg.react_sector) return F1ST_UNKNOWN;
-
-    /* Global announcements (these are what the TV mirrors) */
-    if (g_cfg.react_global && text && text[0]) {
-        if (f1_contains_ci(text, "RED FLAG"))     return F1ST_RED_FLAG;
-        if (f1_contains_ci(text, "VIRTUAL SAFETY CAR")
-                || f1_contains_ci(text, "VSC"))
-            return F1ST_VIRTUAL_SC;
-        if (f1_contains_ci(text, "SAFETY CAR"))   return F1ST_SAFETY_CAR;
-        if (f1_contains_ci(text, "CHEQUERED"))    return F1ST_CHEQUERED;
-    }
-
-    bool isFlag = (cat && cat[0] && strcasecmp(cat, "Flag") == 0);
-    if (!isFlag) return F1ST_UNKNOWN;
-
-    bool isSector = (scope && strcasecmp(scope, "Sector") == 0);
-    if (isSector) {
-        /* Sector-local yellows only when the user opted in */
-        if (g_cfg.react_sector && flag && f1_contains_ci(flag, "YELLOW"))
-            return F1ST_YELLOW;
-        return F1ST_UNKNOWN;
-    }
-    /* Track-scope flags */
-    if (g_cfg.react_global) {
-        if (flag && f1_contains_ci(flag, "RED"))    return F1ST_RED_FLAG;
-        if (flag && f1_contains_ci(flag, "YELLOW")) return F1ST_YELLOW;
-    }
-    return F1ST_UNKNOWN;
-}
-
-/* Map TrackStatus code → F1NetState */
-static F1NetState trackCodeToState(const char* code)
-{
-    if (!code || !code[0]) return F1ST_UNKNOWN;
-    switch (code[0]) {
-        case '1': return F1ST_GREEN;
-        case '2': return F1ST_YELLOW;
-        case '3': return F1ST_YELLOW;      /* Flag / yellow variant           */
-        case '4': return F1ST_SAFETY_CAR;
-        case '5': return F1ST_RED_FLAG;
-        case '6': return F1ST_VIRTUAL_SC;
-        case '7': return F1ST_VSC_ENDING;  /* VSC ending – brief transition to green */
-        default:  return F1ST_UNKNOWN;
-    }
 }
 
 /* Push new state to WLED layer */
@@ -835,7 +767,9 @@ static void processSnapshotRcBacklog(const char* msg)
     int start = (n > 8) ? (n - 8) : 0;
     for (int i = start; i < n; i++) {
         const Back* bi = &list[i % 8];
-        F1NetState st = rcEventToState(bi->cat, bi->flag,
+        F1NetState st = f1_rcEventToState(g_cfg.react_global,
+                                       g_cfg.react_sector,
+                                       bi->cat, bi->flag,
                                        bi->scope, bi->text);
         if (st != F1ST_UNKNOWN) {
             Serial.printf("[F1Net] backlog -> state %d (%s)\n",
@@ -900,7 +834,7 @@ static void processMessage(const char* msg, int len)
                 char code[8] = {};
                 json_str(tsp, "Status", code, sizeof(code));
                 if (code[0]) {
-                    F1NetState ns = trackCodeToState(code);
+                    F1NetState ns = f1_trackCodeToState(code);
                     char tmsg[24] = {};
                     json_str(tsp, "Message", tmsg, sizeof(tmsg));
                     Serial.printf("[F1Net] Snapshot TrackStatus=%s (%s)\n",
@@ -980,7 +914,7 @@ static void processMessage(const char* msg, int len)
         json_str(ap, "Status", code, sizeof(code));
         if (code[0]) {
             json_str(ap, "Message", tmsg, sizeof(tmsg));
-            F1NetState ns = trackCodeToState(code);
+            F1NetState ns = f1_trackCodeToState(code);
             Serial.printf("[F1Net] TrackStatus=%s (%s)\n", code,
                           tmsg[0] ? tmsg : "?");
             static const char* TRK_NAMES[] = {
@@ -1038,8 +972,10 @@ static void processMessage(const char* msg, int len)
            The TrackStatus topic in this feed can stay on code 2 ("Yellow")
            even through safety-car / red-flag periods, so the flag the TV
            mirrors mostly comes from RaceControlMessages.  Derive state
-           changes via the user-configurable rcEventToState(). */
-        F1NetState rcState = rcEventToState(cat, flag, scope, rcMsg);
+           changes via the pure f1_rcEventToState() rules. */
+        F1NetState rcState = f1_rcEventToState(g_cfg.react_global,
+                                          g_cfg.react_sector,
+                                          cat, flag, scope, rcMsg);
         if (rcState != F1ST_UNKNOWN) {
             Serial.printf("[F1Net] RC flag -> state %d\n", (int)rcState);
             applyState(rcState);

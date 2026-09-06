@@ -142,8 +142,16 @@ inline time_t f1_parseUtc(const char* dateStr, const char* timeStr)
         if (h > 23 || mi > 59 || s > 59) return 0;
     }
 
-    return f1_epochFromFields((int)y, (unsigned)mo, (unsigned)d,
-                              (unsigned)h, (unsigned)mi, (unsigned)s);
+    time_t e = f1_epochFromFields((int)y, (unsigned)mo, (unsigned)d,
+                                  (unsigned)h, (unsigned)mi, (unsigned)s);
+
+    /* Reject impossible calendar dates (e.g. 2026-02-30) by round-tripping
+       through the civil arithmetic: a real date must map back to itself. */
+    int   vy; unsigned vmo, vd, vh, vmi, vs;
+    f1_fieldsFromEpoch(e, vy, vmo, vd, vh, vmi, vs);
+    if (vy != (int)y || vmo != (unsigned)mo || vd != (unsigned)d) return 0;
+
+    return e;
 }
 
 /* ── parseIsoUtc ──────────────────────────────────────────────────────────
